@@ -1,0 +1,11 @@
+# Run directories (auto-generated output)
+run_*/
+
+# Julia artifacts
+*.jl.cov
+*.jl.mem
+Manifest.toml
+
+# OS files
+.DS_Store
+Thumbs.db
