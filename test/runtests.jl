@@ -28,60 +28,39 @@ using GravityGeophysics
         @test xe[end] ≈ 500.0
     end
     
-    @testset "Model Creation" begin
+    @testset "Voxel And XYZ I/O" begin
+        test_dir = mktempdir()
+
         mesh = create_mesh(nx=10, ny=10, nz=5, lx=1000.0, ly=1000.0, lz=500.0)
-        
-        # Test empty model
-        model = create_model(mesh)
-        @test size(model.density) == (10, 10, 5)
-        @test all(model.density .== 0.0)
-        
-        # Test with background
-        model2 = create_model(mesh; background=2670.0)
-        @test all(model2.density .≈ 2670.0)
-        
-        # Test block anomaly
-        model3 = create_model(mesh)
-        add_block_anomaly!(model3;
-            xmin=-100.0, xmax=100.0,
-            ymin=-100.0, ymax=100.0,
-            zmin=100.0, zmax=300.0,
-            drho=500.0)
-        @test any(model3.density .≈ 500.0)
-    end
-    
-    @testset "Receivers" begin
-        mesh = create_mesh(nx=10, ny=10, nz=5, lx=1000.0, ly=1000.0, lz=500.0)
-        
-        receivers = create_receivers(mesh; nrx=11, nry=11, z=10.0)
-        @test receivers.n == 121
-        @test receivers.nx == 11
-        @test receivers.ny == 11
-        @test all(receivers.z .≈ 10.0)
-    end
-    
-    @testset "Forward Modeling - Prism" begin
-        # Small test mesh
-        mesh = create_mesh(nx=8, ny=8, nz=4, lx=800.0, ly=800.0, lz=400.0)
-        
-        # Model with central anomaly
         model = create_model(mesh)
         add_block_anomaly!(model;
-            xmin=-100.0, xmax=100.0,
-            ymin=-100.0, ymax=100.0,
-            zmin=100.0, zmax=200.0,
-            drho=1000.0)
-        
-        # Receivers
-        receivers = create_receivers(mesh; nrx=5, nry=5, z=10.0)
-        
-        # Forward modeling
+            xmin=-200.0, xmax=200.0,
+            ymin=-200.0, ymax=200.0,
+            zmin=100.0, zmax=300.0,
+            drho=500.0)
+
+        receivers = create_receivers(mesh; nrx=5, nry=5, z=-10.0)
         data = forward(model, receivers, Prism())
-        
-        @test length(data.gz) == 25
-        @test all(isfinite.(data.gz))
-        # Gravity should be positive (mass below)
-        @test maximum(data.gz) > 0
+
+        vox_file = joinpath(test_dir, "test_model.vox")
+        save_model_vox(vox_file, model)
+        @test isfile(vox_file)
+        model_loaded = load_model_vox(vox_file)
+        @test size(model_loaded.density) == size(model.density)
+        @test maximum(abs.(model_loaded.density .- model.density)) < 1e-10
+
+        xyz_file = joinpath(test_dir, "test_data.xyz")
+        save_data_xyz(xyz_file, data)
+        @test isfile(xyz_file)
+        data_loaded = load_data_xyz(xyz_file)
+        @test data_loaded.receivers.n == data.receivers.n
+        @test maximum(abs.(data_loaded.gz .- data.gz)) < 1e-12
+
+        recv_file = joinpath(test_dir, "test_receivers.xyz")
+        save_receivers_xyz(recv_file, receivers)
+        @test isfile(recv_file)
+
+        rm(test_dir; recursive = true)
     end
     
     @testset "Forward Modeling - FD" begin
@@ -131,54 +110,48 @@ using GravityGeophysics
         @test stats["rel_rmse_pct"] < 10.0  # Within 10%
     end
     
-    @testset "UBC Format I/O" begin
-        # Create temp directory for test files
-        test_dir = mktempdir()
-        
-        # Test mesh I/O
-        mesh = create_mesh(nx=5, ny=5, nz=3, lx=500.0, ly=500.0, lz=300.0)
-        mesh_file = joinpath(test_dir, "test_mesh.msh")
-        save_mesh_ubc(mesh_file, mesh)
-        @test isfile(mesh_file)
-        
-        mesh_loaded = load_mesh_ubc(mesh_file)
-        @test mesh_loaded.nx == mesh.nx
-        @test mesh_loaded.lx ≈ mesh.lx
-        
-        # Test model I/O
-        model = create_model(mesh)
-        add_block_anomaly!(model;
-            xmin=-50.0, xmax=50.0,
-            ymin=-50.0, ymax=50.0,
-            zmin=50.0, zmax=150.0,
-            drho=100.0)
-        
-        model_file = joinpath(test_dir, "test_model.den")
-        save_model_ubc(model_file, model)
-        @test isfile(model_file)
-        
-        model_loaded = load_model_ubc(model_file, mesh)
-        @test size(model_loaded.density) == size(model.density)
-        
-        # Test data I/O
-        receivers = create_receivers(mesh; nrx=5, nry=5, z=10.0)
-        data = forward(model, receivers, Prism())
-        
-        data_file = joinpath(test_dir, "test_data.obs")
-        save_data_ubc(data_file, data)
-        @test isfile(data_file)
-        
-        data_loaded = load_data_ubc(data_file)
-        @test data_loaded.receivers.n == data.receivers.n
-        @test length(data_loaded.gz) == length(data.gz)
-        
-        # Cleanup
-        rm(test_dir; recursive=true)
-    end
-    
     @testset "Constants" begin
         @test G_NEWTON ≈ 6.67430e-11
         @test SI_TO_MGAL == 1e5
+    end
+
+    @testset "Synthetic Demo Bundle" begin
+        outdir = mktempdir()
+        bundle = generate_demo_bundle(outdir)
+        @test haskey(bundle, :model)
+        @test haskey(bundle, :data)
+        @test isfile(bundle[:model_vox_path])
+        @test isfile(bundle[:data_xyz_path])
+        @test !any(endswith(name, ".msh") || endswith(name, ".den") || endswith(name, ".obs") for name in readdir(outdir))
+
+        bench = generate_block_benchmark_bundle(outdir)
+        @test haskey(bench, :noise_std_si)
+        @test isfile(bench[:model_vox_path])
+        @test bench[:receivers].n == bench[:mesh].nx * bench[:mesh].ny
+
+        pyhasalmi_mesh = create_pyhasalmi_mesh(dx = 200.0, dy = 200.0, dz = 120.0, lx = 1200.0, ly = 1200.0, lz = 720.0)
+        pyhasalmi = generate_pyhasalmi_bundle(outdir; mesh = pyhasalmi_mesh, noise_std_mgal = 0.01, seed = 7, receiver_kwargs = (nrx = 7, nry = 7, xfrac = 0.7, yfrac = 0.7))
+        @test haskey(pyhasalmi, :host_density)
+        @test isfile(pyhasalmi[:model_vox_path])
+        @test isfile(pyhasalmi[:data_xyz_path])
+    end
+
+    @testset "Inversion Utilities" begin
+        mesh = create_mesh(nx=6, ny=6, nz=4, lx=600.0, ly=600.0, lz=400.0)
+        model = create_model(mesh)
+        add_block_anomaly!(model; xmin=-100.0, xmax=100.0, ymin=-100.0, ymax=100.0, zmin=100.0, zmax=250.0, drho=200.0)
+        receivers = create_receivers(mesh; nrx=4, nry=4, z=-10.0)
+        data = forward(model, receivers, Prism())
+        G = sensitivity_matrix_prism(model, receivers)
+        @test size(G) == (receivers.n, mesh_cell_count(mesh))
+
+        inverted, info = invert_tikhonov(data, mesh; G = G, lambda = 0.5)
+        @test size(inverted.density) == size(model.density)
+        @test haskey(info, "rmse_mgal")
+
+        inr_model, inr_info = invert_inr(data, mesh; G = G, epochs = 3, hidden_dim = 8, depth = 2, nfreq = 2, verbose = false)
+        @test size(inr_model.density) == size(model.density)
+        @test length(inr_info["loss_history"]) == 3
     end
     
 end

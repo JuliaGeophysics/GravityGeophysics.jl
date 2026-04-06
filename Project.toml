@@ -1,17 +1,31 @@
 name = "GravityGeophysics"
-uuid = "8b2c4e3f-5a6d-7e8f-9b0c-1d2e3f4a5b6c"
+uuid = "d3c0d1c8-1a54-4e61-9e9a-0c0fbe1d7b7f"
 authors = ["Pankaj K Mishra", "and contributors"]
-version = "0.1.0"
+version = "0.2.0"
 
 [deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
+GeoInterface = "cf35fbd7-0cd7-5166-be24-54bfbe79505f"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Proj = "c94c279d-25a6-4763-9509-64d165bea63e"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Shapefile = "8e980c4a-a4fe-5da2-b3a7-4b4b0353a2f4"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [compat]
+CairoMakie = "0.14"
+Flux = "0.16"
+GLMakie = "0.12"
+GeoInterface = "1"
 Plots = "1"
+Proj = "1"
+Shapefile = "0.13"
 julia = "1.10"
 
 [extras]

@@ -1,5 +1,7 @@
 # Run directories (auto-generated output)
 run_*/
+examples/run_*/
+examples/demo_output/
 
 # Julia artifacts
 *.jl.cov

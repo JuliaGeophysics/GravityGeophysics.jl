@@ -1,94 +1,90 @@
 # Author: @pankajkmishra
 """
-# GravityGeophysics.jl
+Julia package for 3D gravity forward modeling, inversion, and visualization.
 
-Julia package for 3D gravity forward modeling and analysis.
-
-## Features
-- 3D mesh creation with UBC format support
-- Forward modeling using:
-  - Prism (Analytical) method - Plouff (1976) / Blakely (1995)
-  - Finite Difference (FD) method - Poisson equation solver
-- UBC format I/O for models and data
-- Visualization and comparison tools
-
-## Quick Start
-```julia
-using GravityGeophysics
-
-# Create mesh
-mesh = create_mesh(nx=64, ny=64, nz=32, 
-                   lx=160000.0, ly=160000.0, lz=80000.0)
-
-# Load model in UBC format
-model = load_model_ubc("model.ubc", mesh)
-
-# Create receivers
-receivers = GravityReceivers(mesh, nrx=51, nry=51, z=50.0)
-
-# Forward modeling (Prism method)
-data = forward(model, receivers, Prism())
-
-# Or use FD method
-data_fd = forward(model, receivers, FiniteDifference())
-
-# Save data in UBC format
-save_data_ubc("gravity_data.ubc", data, receivers)
-```
+The active exchange workflow uses voxel models (`.vox`) and gravity or receiver tables
+in xyz text format (`.xyz`).
 """
 module GravityGeophysics
 
+using CairoMakie
+using Flux
+using GLMakie
+using GeoInterface
 using LinearAlgebra
+using Random
+using Proj
+using Shapefile
+using SparseArrays
 using Statistics
 using Printf
-using DelimitedFiles
 
-# Physical constants
-const G_NEWTON = 6.67430e-11  # Gravitational constant [m³/(kg·s²)]
-const SI_TO_MGAL = 1e5        # Conversion factor SI to mGal
+const G_NEWTON = 6.67430e-11
+const SI_TO_MGAL = 1e5
+const has_visualization = true
 
-# Include submodules
 include("Mesh.jl")
-include("UBCFormat.jl")
+include("Geometry.jl")
+include("VoxelIO.jl")
 include("ForwardPrism.jl")
 include("ForwardFD.jl")
 include("Forward.jl")
+include("Synthetic.jl")
+include("Inversion.jl")
+include("INRInversion.jl")
+include("GeoOverlay.jl")
+include("PlotData.jl")
+include("PlotModel3D.jl")
 
-# Conditionally include visualization
-has_visualization = false
-try
-    using Plots
-    include("Visualization.jl")
-    global has_visualization = true
-    export plot_gravity_comparison, plot_model_slice
-catch e
-    @warn "Plots not available, visualization functionality disabled"
-end
-
-# Export mesh types and functions
 export GravityMesh, create_mesh, mesh_info
 export get_cell_centers, get_cell_edges, get_nodes
+export cell_volumes, mesh_cell_count
 
-# Export model types and functions
 export GravityModel, create_model, set_density!
 export add_block_anomaly!, add_sphere_anomaly!
 
-# Export receiver types
 export GravityReceivers, create_receivers
+export load_model_vox, save_model_vox
+export load_data_xyz, save_data_xyz, save_receivers_xyz
 
-# Export UBC I/O functions
-export load_model_ubc, save_model_ubc
-export load_data_ubc, save_data_ubc
-export load_mesh_ubc, save_mesh_ubc
-
-# Export forward modeling
 export ForwardMethod, Prism, FiniteDifference, FDOptions
 export forward, forward_prism, forward_fd, forward_with_info
-
-# Export data types
 export GravityData
 
-# Export utilities
+export edges_from_centers, sample_polyline, build_section_surface_polyline
+
+export create_terrascope_demo_mesh
+export create_terrascope_synthetic_model
+export create_demo_receivers
+export generate_demo_bundle
+export create_block_benchmark_mesh
+export create_block_benchmark_model
+export create_block_benchmark_receivers
+export generate_block_benchmark_bundle
+export create_pyhasalmi_mesh
+export create_pyhasalmi_synthetic_model
+export create_pyhasalmi_receivers
+export generate_pyhasalmi_bundle
+
+export sensitivity_matrix_prism
+export gradient_operators
+export depth_weighting
+export invert_tikhonov
+export invert_inr
+export compare_inversion_methods
+
+export plot_gravity_comparison
+export plot_gravity_data
+export plot_model_slice
+export plot_inversion_comparison
+export plot_orthogonal_inversion_comparison
+export plot_convergence
+export plot_receiver_locations
+
+export plot_shapefile_on_3d!
+export plot_shapefile_on_axis!
+export launch_model_viewer
+
 export G_NEWTON, SI_TO_MGAL
 export compute_stats, compare_methods
 

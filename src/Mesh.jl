@@ -182,6 +182,16 @@ Alias for get_cell_edges. Get node coordinates (vertices of cells).
 """
 get_nodes(mesh::GravityMesh) = get_cell_edges(mesh)
 
+mesh_cell_count(mesh::GravityMesh) = mesh.nx * mesh.ny * mesh.nz
+
+function cell_volumes(mesh::GravityMesh)
+    volumes = Array{Float64}(undef, mesh.nx, mesh.ny, mesh.nz)
+    for k in 1:mesh.nz, j in 1:mesh.ny, i in 1:mesh.nx
+        volumes[i, j, k] = mesh.dx[i] * mesh.dy[j] * mesh.dz[k]
+    end
+    return volumes
+end
+
 """
     mesh_info(mesh::GravityMesh)
 

@@ -206,24 +206,14 @@ Save density model to UBC format.
 """
 function save_model_ubc(filename::String, model::GravityModel; 
                         header::String="# UBC Gravity Model")
-    mesh = model.mesh
-    
     open(filename, "w") do io
-        # Write header
         if !isempty(header)
             println(io, header)
         end
-        
-        # Write dimensions
-        @printf(io, "%d %d %d\n", mesh.nx, mesh.ny, mesh.nz)
-        
-        # Write cell widths as single representative value (uniform) or first value
-        @printf(io, "%.1f %.1f %.1f\n", mesh.dx[1], mesh.dy[1], mesh.dz[1])
-        
-        # Write density values (UBC order)
-        for k in 1:mesh.nz
-            for j in 1:mesh.ny
-                for i in 1:mesh.nx
+
+        for k in 1:model.mesh.nz
+            for j in 1:model.mesh.ny
+                for i in 1:model.mesh.nx
                     @printf(io, "%.4f\n", model.density[i, j, k])
                 end
             end
