@@ -1,6 +1,6 @@
 name = "GravityGeophysics"
 uuid = "d3c0d1c8-1a54-4e61-9e9a-0c0fbe1d7b7f"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Pankaj K Mishra", "and contributors"]
 
 [deps]
