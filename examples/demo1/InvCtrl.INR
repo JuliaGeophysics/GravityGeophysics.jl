@@ -1,0 +1,18 @@
+Algorithm                         : INR
+Exit search when rms is less than : 1
+Maximum number of iterations      : 1500
+Density bounds (kg/m3)            : -500 500
+Error floor (mGal)                : 0
+Error percent                     : 0
+Hidden width                      : 48
+Hidden layers                     : 3
+Fourier frequencies               : 4
+Learning rate                     : 0.01
+Coordinate scaling                : per-axis
+Seed                              : 42
+Divergence factor                 : 3
+Maximum restarts                  : 3
+Learning rate schedule            : cosine
+Learning rate floor               : 0.05
+Frequency annealing               : 0.5
+Invert padding                    : no

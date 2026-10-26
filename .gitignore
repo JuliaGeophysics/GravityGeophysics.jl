@@ -1,7 +1,14 @@
-# Run directories (auto-generated output)
+# Inversion run output: every six-file Invert3D writes model.den, data.pred, History.log,
+# Summary.txt and a provenance copy of the inputs/; plots/ holds figures from the demo scripts.
+# The demos ship their inputs only; the outputs are reproduced by running the demo scripts.
 run_*/
-examples/run_*/
-examples/demo_output/
+outputs/
+plots/
+*.pred
+sensitivity.jld2
+
+# figures the example scripts write beside the demo inputs
+examples/**/*.png
 
 # Julia artifacts
 *.jl.cov
@@ -11,3 +18,8 @@ Manifest.toml
 # OS files
 .DS_Store
 Thumbs.db
+
+# Documenter/Vitepress build products
+docs/build/
+docs/node_modules/
+docs/package-lock.json

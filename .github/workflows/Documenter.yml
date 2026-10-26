@@ -1,0 +1,42 @@
+name: Documentation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Skip intermediate builds: always.
+  # Cancel intermediate builds: only if it is a pull request build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+jobs:
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # needed to allow julia-actions/cache to proactively delete old caches that it has created
+      contents: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.13.0'  # match the CI matrix
+      - uses: julia-actions/cache@v3
+      # the viewer docstrings only exist when GLMakie loads, which needs a GL stack and a display
+      - name: Install OpenGL and a virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xorg-dev mesa-utils libgl1 libglu1-mesa freeglut3-dev \
+                                  libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-docdeploy@v1
+        with:
+          prefix: xvfb-run -s '-screen 0 1024x768x24'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}

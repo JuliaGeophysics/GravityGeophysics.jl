@@ -1,91 +1,82 @@
+# GravityGeophysics package module entry.
 # Author: @pankajkmishra
-"""
-Julia package for 3D gravity forward modeling, inversion, and visualization.
+# This file includes all core source scripts and defines the exported public API.
 
-The active exchange workflow uses voxel models (`.vox`) and gravity or receiver tables
-in xyz text format (`.xyz`).
-"""
 module GravityGeophysics
 
-using CairoMakie
-using Flux
-using GLMakie
-using GeoInterface
 using LinearAlgebra
-using Random
-using Proj
-using Shapefile
-using SparseArrays
 using Statistics
+using Dates
 using Printf
+using SparseArrays
+using Proj
 
-const G_NEWTON = 6.67430e-11
-const SI_TO_MGAL = 1e5
-const has_visualization = true
+#----- Data and model I/O (.xyz data, block-layout models) -----------------#
 
-include("Mesh.jl")
-include("Geometry.jl")
-include("VoxelIO.jl")
-include("ForwardPrism.jl")
-include("ForwardFD.jl")
-include("Forward.jl")
-include("Synthetic.jl")
-include("Inversion.jl")
-include("INRInversion.jl")
-include("GeoOverlay.jl")
-include("PlotData.jl")
-include("PlotModel3D.jl")
+include("Data.jl")
+include("Model.jl")
 
-export GravityMesh, create_mesh, mesh_info
-export get_cell_centers, get_cell_edges, get_nodes
-export cell_volumes, mesh_cell_count
+#----- Headless core/padding utilities (always available) ------------------#
 
-export GravityModel, create_model, set_density!
-export add_block_anomaly!, add_sphere_anomaly!
+include("CoreUtils3D.jl")
 
-export GravityReceivers, create_receivers
-export load_model_vox, save_model_vox
-export load_data_xyz, save_data_xyz, save_receivers_xyz
+#----- Control files -------------------------------------------------------#
 
-export ForwardMethod, Prism, FiniteDifference, FDOptions
-export forward, forward_prism, forward_fd, forward_with_info
-export GravityData
+include("Control3D.jl")
 
-export edges_from_centers, sample_polyline, build_section_surface_polyline
+#----- Forward solvers, synthetic models and misfit -------------------------#
 
-export create_terrascope_demo_mesh
-export create_terrascope_synthetic_model
-export create_demo_receivers
-export generate_demo_bundle
-export create_block_benchmark_mesh
-export create_block_benchmark_model
-export create_block_benchmark_receivers
-export generate_block_benchmark_bundle
-export create_pyhasalmi_mesh
-export create_pyhasalmi_synthetic_model
-export create_pyhasalmi_receivers
-export generate_pyhasalmi_bundle
+include("Fwd3D.jl")
+include("Fwd3D_FD.jl")
+include("Synthetic3D.jl")
 
-export sensitivity_matrix_prism
-export gradient_operators
-export depth_weighting
-export invert_tikhonov
-export invert_inr
-export compare_inversion_methods
+#----- Gauss-Newton inversion ----------------------------------------------#
 
-export plot_gravity_comparison
-export plot_gravity_data
-export plot_model_slice
-export plot_inversion_comparison
-export plot_orthogonal_inversion_comparison
-export plot_convergence
-export plot_receiver_locations
+include("Inv3D.jl")
+include("Inv3D_GN.jl")
 
-export plot_shapefile_on_3d!
-export plot_shapefile_on_axis!
-export launch_model_viewer
+#----- Implicit-neural-representation inversion (Lux.jl) -------------------#
 
-export G_NEWTON, SI_TO_MGAL
-export compute_stats, compare_methods
+include("Inv3D_INR.jl")
+
+#----- Mesh design ---------------------------------------------------------#
+
+include("MakeMesh3D.jl")
+
+#----- Headless plots (CairoMakie) -----------------------------------------#
+
+include("PlotModel.jl")
+include("PlotData3D.jl")
+
+#----- Interactive model viewers (optional, requires GLMakie) --------------#
+
+try
+    using GLMakie
+    include("PlotModel3D.jl")
+    export depth_slice_viewer, xz_slice_viewer, yz_slice_viewer, grav_3d_viewer, draw_north_and_scale!
+    export PlotModelXY, PlotModelXZ, PlotModelYZ, PlotModelXYZ
+catch err
+    @warn "GLMakie not available, the interactive model viewers are disabled" err
+end
+
+#----- Public API ----------------------------------------------------------#
+
+export GravData3D, ReadData3D, WriteData3D, data_like, ndata, has_geographic
+export GravModel3D, ReadModel3D, WriteModel3D, model_like, same_mesh, air_mask, cell_volumes, surface_depth, sensor_depth
+export edges_from_centers, core_indices, z_indices_for_max_depth, lateral_core_ranges
+export FwdCtrl3D, ReadFwdCtrl3D, WriteFwdCtrl3D
+export InvCtrl3D, ReadInvCtrl3D, WriteInvCtrl3D
+export InvCtrlINR3D, ReadInvCtrlINR3D, WriteInvCtrlINR3D, ReadInvCtrl
+export Cov3D, ReadCov3D, WriteCov3D
+export GravKernel3D, sensitivity_row, forward3d, Sensitivity3D, SaveSensitivity3D, LoadSensitivity3D, check_receivers, ForwardSolve3D
+export FDCtrl3D, forward3d_fd
+export sphere_anomaly, add_prism!, add_dyke!, add_noise, chi2_rms3d
+export AbstractInversion3D, Inv3DOptions, Inv3DResult, Invert3D, model_weights
+export GaussNewton3DConfig, GaussNewton3DResult, GaussNewton3D
+export INR3DConfig, INR3DResult, INR3D
+export MakeMesh3D, design_mesh, build_mesh_bundle, data_spacing
+export compute_colorrange, prepare_model_arrays, model_slice
+export plot_grav3d_data, plot_inv3d_convergence, PlotData3D
+export GAMMA, SI_TO_MGAL
 
 end # module

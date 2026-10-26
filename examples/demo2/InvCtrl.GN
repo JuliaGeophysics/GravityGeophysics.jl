@@ -1,0 +1,20 @@
+Algorithm                         : GN
+Initial damping factor lambda     : auto
+Exit search when rms is less than : 1
+Maximum number of iterations      : 20
+Lambda cooling factor             : 2
+Density bounds (kg/m3)            : -400 400
+Max line search steps             : 12
+Smallness weight                  : 0.04
+Smoothing weight x                : 1
+Smoothing weight y                : 1
+Smoothing weight z                : 1
+Sensitivity weighting             : sensitivity
+Depth weighting exponent          : 2
+Depth weighting z0 (m)            : auto
+Error floor (mGal)                : 0
+Error percent                     : 0
+GN damping                        : 0.001
+Maximum CG iterations             : 50
+CG tolerance                      : 0.001
+Invert padding                    : yes

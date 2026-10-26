@@ -1,0 +1,141 @@
+# Headless 3D model core/padding detection utilities.
+# Author: @pankajkmishra
+# These functions identify unpadded core regions and depth ranges without
+# requiring any visualization backend. Safe for clusters and CI.
+
+"""
+    edges_from_centers(c::AbstractVector)
+
+Compute cell-edge coordinates from cell centers by midpoint extrapolation.
+"""
+edges_from_centers(c::AbstractVector) = begin
+    n = length(c)
+    n < 2 && return [c[1] - 0.5; c[1] + 0.5]
+    mids       = (c[1:end-1] .+ c[2:end]) ./ 2
+    first_edge = c[1] - (c[2] - c[1]) / 2
+    last_edge  = c[end] + (c[end] - c[end-1]) / 2
+    vcat(first_edge, mids, last_edge)
+end
+
+"""
+    _mode_width(w::AbstractVector)
+
+Most frequently occurring cell width in `w`.
+"""
+function _mode_width(w::AbstractVector)
+    counts = Dict{Float64,Int}()
+    @inbounds for v in w
+        key         = round(float(v); sigdigits = 6)
+        counts[key] = get(counts, key, 0) + 1
+    end
+    best_w, best_c = first(keys(counts)), 0
+    for (k, c) in counts
+        if c > best_c || (c == best_c && k < best_w)
+            best_w, best_c = k, c
+        end
+    end
+    return best_w
+end
+
+"""
+    core_indices(c::AbstractVector; tol::Real=0.2)
+
+Return the index range of the largest contiguous block of cells whose widths are within `tol * w_ref` of the reference core width `w_ref`.
+"""
+core_indices(c::AbstractVector; tol::Real = 0.2) = _core_range(abs.(diff(edges_from_centers(c))); tol)
+
+# core_indices on cell widths, shared with the 2D code, which has the widths exactly
+function _core_range(w::AbstractVector; tol::Real = 0.2)
+    n = length(w)
+    n <= 4 && return 1:n
+    w_ref   = _mode_width(w)
+    is_core = abs.(w .- w_ref) .<= tol * w_ref
+    best_i, best_len = 1, 0
+    i = 1
+    while i <= n
+        if is_core[i]
+            j = i
+            while j <= n && is_core[j]; j += 1; end
+            if (j - i) > best_len
+                best_i, best_len = i, (j - i)
+            end
+            i = j
+        else
+            i += 1
+        end
+    end
+    best_len > 0 ? (best_i:(best_i + best_len - 1)) : (1:n)
+end
+
+"""
+    z_indices_for_max_depth(zc::AbstractVector, max_depth::Real)
+
+Return `1:k` where cumulative depth best matches `max_depth`.
+"""
+z_indices_for_max_depth(zc::AbstractVector, max_depth::Real) = _depth_range(abs.(diff(edges_from_centers(zc))), max_depth)
+
+# z_indices_for_max_depth on layer thicknesses, shared with the 2D code
+function _depth_range(dz::AbstractVector, max_depth::Real)
+    cum = cumsum(dz)
+    if max_depth <= cum[1]
+        return 1:1
+    elseif max_depth >= cum[end]
+        return 1:length(dz)
+    else
+        k = findfirst(>=(max_depth), cum)::Int
+        if k > 1 && (max_depth - cum[k-1]) < (cum[k] - max_depth)
+            return 1:(k-1)
+        else
+            return 1:k
+        end
+    end
+end
+
+"""
+    _npad_core_ranges(m)
+
+Core index ranges `(ix, iy)` derived from an explicit `m.npad` padding-cell count `(nx_pad, ny_pad)`, or `nothing` when `npad` is absent, zero, negative, or would produce an empty range — callers then fall back to width detection.
+"""
+function _npad_core_ranges(m)
+    hasproperty(m, :npad) || return nothing
+    npad = m.npad
+    length(npad) == 2 || return nothing
+    nx_pad, ny_pad = Int(npad[1]), Int(npad[2])
+    (nx_pad >= 0 && ny_pad >= 0) || return nothing
+    (nx_pad > 0 || ny_pad > 0) || return nothing
+    ix = (nx_pad + 1):(length(m.cx) - nx_pad)
+    iy = (ny_pad + 1):(length(m.cy) - ny_pad)
+    (isempty(ix) || isempty(iy)) && return nothing
+    return ix, iy
+end
+
+"""
+    lateral_core_ranges(m; tol=0.2, use_npad=true)
+
+Return `(ix, iy)` core index ranges for any model with `.cx` and `.cy` fields.
+"""
+function lateral_core_ranges(m; tol::Real = 0.2, use_npad::Bool = true)
+    ix = core_indices(m.cx; tol=tol)
+    iy = core_indices(m.cy; tol=tol)
+    if use_npad
+        r = _npad_core_ranges(m)
+        if !isnothing(r)
+            return (_is_evenly_padded(ix, length(m.cx)) ? r[1] : ix,
+                    _is_evenly_padded(iy, length(m.cy)) ? r[2] : iy)
+        end
+    end
+    return ix, iy
+end
+
+# true when the core range `r` leaves the same number of padding cells on both sides of an axis of `n` cells
+_is_evenly_padded(r::AbstractRange, n::Integer) = first(r) - 1 == n - last(r)
+
+"""
+    core_view(m; tol=0.2, use_npad=true)
+
+Return `(Rview, ix, iy)` where `Rview = @view m.A[ix, iy, :]`.
+"""
+function core_view(m; tol::Real = 0.2, use_npad::Bool = true)
+    ix, iy = lateral_core_ranges(m; tol=tol, use_npad=use_npad)
+    return (@view m.A[ix, iy, :]), ix, iy
+end
