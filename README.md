@@ -13,7 +13,7 @@ Gauss–Newton and an implicit neural representation ([Lux.jl](https://github.co
 share one driver and one plain-text file workflow, so you can swap one control file to change
 method. Part of the [JuliaGeophysics ecosystem](https://github.com/JuliaGeophysics).
 
-## Requirements
+## Requirements 
 
 - [Julia](https://julialang.org) 1.13.0 — the only supported version
 
