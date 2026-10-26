@@ -29,6 +29,7 @@ Lux = "1.31.4"
 NCDatasets = "0.14.15"
 Optimisers = "0.4.11"
 Proj = "1"
+SparseArrays = "1.13"
 Zygote = "0.7.14"
 julia = "1.13"
 
