@@ -1,39 +1,54 @@
-# Design an inversion mesh around a survey.
-# Author: @pankajkmishra
-# Writes the start model and the covariance next to the data. Edit the settings block, then:
-#
-#   julia --project=. examples/make_mesh3D.jl examples/demo1/data.xyz
-
 using GravityGeophysics
 
-data_file      = length(ARGS) >= 1 ? ARGS[1] : "examples/demo1/data.xyz"
-out_model      = length(ARGS) >= 2 ? ARGS[2] : joinpath(dirname(abspath(data_file)), "mesh_start_model.den")
-out_covariance = length(ARGS) >= 3 ? ARGS[3] : joinpath(dirname(out_model), "C3.dat")
+data_file = length(ARGS) >= 1 ? ARGS[1] : ""
+out_model = length(ARGS) >= 2 ? ARGS[2] : (isempty(data_file) ? "" : joinpath(dirname(abspath(data_file)), "mesh_start_model.den"))
+topo_file = length(ARGS) >= 3 ? ARGS[3] : ""
+out_mask  = length(ARGS) >= 4 ? ARGS[4] : (isempty(out_model) ? "" : joinpath(dirname(out_model), "mesh_start_model.mask"))
+ρ_bg      = length(ARGS) >= 5 ? something(tryparse(Float64, ARGS[5]), 0.0) : 0.0
+mode      = length(ARGS) >= 6 ? Symbol(lowercase(ARGS[6])) : Symbol(lowercase(get(ENV, "MAGGEO_MESH_MODE", "gui")))
 
-background_density = 0.0      # kg/m3 contrast the mesh starts at
-cell_width_frac    = 0.5      # core cell as a fraction of the station spacing
-n_pad              = 6        # padding cells per side
-pad_factor         = 1.4      # how fast the padding grows
-first_layer_div    = 5.0      # top layer thickness = core cell / this
-vertical_factor    = 1.15     # layer growth with depth
-depth_mult         = 0.5      # model depth as a multiple of the narrower core width
-cov_value          = 0.3      # smoothing written into the covariance file
-cov_apply          = 2
+topo_crs        = "EPSG:4326"
+cell_width_frac = 0.5
+n_pad           = nothing
+pad_factor      = 1.4
+first_layer_div = 2.0
+vertical_factor = 1.4
+depth_mult      = 0.5
+air_layers      = 0
+air_factor      = 1.35
+air_first_div   = 2.0
 
-# a callable (north, east) -> elevation in metres, or `nothing` for flat ground
-topography = nothing
+colormap             = COLORMAP
+density_range = (-300.0, 300.0)
+site_color           = :black
+site_size_full       = 6
+site_size_core       = 5
+grid_color           = (:grey, 0.7)
+grid_linewidth       = 1.0
+fig_size             = (1500, 1000)
 
 MakeMesh3D(data_file;
-    out_model          = out_model,
-    out_covariance     = out_covariance,
-    topography         = topography,
-    background_density = background_density,
-    cell_width_frac    = cell_width_frac,
-    n_pad              = n_pad,
-    pad_factor         = pad_factor,
-    first_layer_div    = first_layer_div,
-    vertical_factor    = vertical_factor,
-    depth_mult         = depth_mult,
-    cov_value          = cov_value,
-    cov_apply          = cov_apply,
+    out_model            = out_model,
+    out_mask             = out_mask,
+    topo_file            = topo_file,
+    topo_crs             = topo_crs,
+    ρ_bg                 = ρ_bg,
+    mode                 = mode,
+    cell_width_frac      = cell_width_frac,
+    n_pad                = n_pad,
+    pad_factor           = pad_factor,
+    first_layer_div      = first_layer_div,
+    vertical_factor      = vertical_factor,
+    depth_mult           = depth_mult,
+    air_layers           = air_layers,
+    air_factor           = air_factor,
+    air_first_div        = air_first_div,
+    colormap             = colormap,
+    density_range = density_range,
+    site_color           = site_color,
+    site_size_full       = site_size_full,
+    site_size_core       = site_size_core,
+    grid_color           = grid_color,
+    grid_linewidth       = grid_linewidth,
+    fig_size             = fig_size,
 )

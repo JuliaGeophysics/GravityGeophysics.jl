@@ -1,82 +1,78 @@
 # GravityGeophysics package module entry.
 # Author: @pankajkmishra
-# This file includes all core source scripts and defines the exported public API.
-
+# 3D gravity: density-contrast models on the same tensor mesh and model file as the resistivity
+# and susceptibility models, so a density model opens in the same viewers. x north, y east, z DOWN.
 module GravityGeophysics
 
-using LinearAlgebra
-using Statistics
+using CairoMakie
 using Dates
+using GeoInterface
+using LinearAlgebra
 using Printf
+using Random
+using Shapefile
 using SparseArrays
-using Proj
+using Statistics: mean, median, quantile, std
+import Proj
 
-#----- Data and model I/O (.xyz data, block-layout models) -----------------#
-
-include("Data.jl")
+#----- Model files and masks ---------------------------------------------#
 include("Model.jl")
-
-#----- Headless core/padding utilities (always available) ------------------#
-
+include("Mask3D.jl")
+include("MeshToMesh.jl")
+#----- Data files (with the survey frame) and rotation -------------------#
+include("Data.jl")
+include("Rotate.jl")
+#----- Core/padding utilities, shapefile overlays, georeferencing ---------#
 include("CoreUtils3D.jl")
-
-#----- Control files -------------------------------------------------------#
-
-include("Control3D.jl")
-
-#----- Forward solvers, synthetic models and misfit -------------------------#
-
+include("ShapefileOverlay.jl")
+include("GeoRef3D.jl")
+#----- Forward modelling --------------------------------------------------#
 include("Fwd3D.jl")
-include("Fwd3D_FD.jl")
-include("Synthetic3D.jl")
-
-#----- Gauss-Newton inversion ----------------------------------------------#
-
+#----- Inversion ----------------------------------------------------------#
+include("Control3D.jl")
 include("Inv3D.jl")
-include("Inv3D_GN.jl")
-
-#----- Implicit-neural-representation inversion (Lux.jl) -------------------#
-
-include("Inv3D_INR.jl")
-
+include("Inv3D_LSQR.jl")
 #----- Mesh design ---------------------------------------------------------#
-
+include("Lakes3D.jl")
 include("MakeMesh3D.jl")
 
-#----- Headless plots (CairoMakie) -----------------------------------------#
-
-include("PlotModel.jl")
-include("PlotData3D.jl")
-
-#----- Interactive model viewers (optional, requires GLMakie) --------------#
+#----- Visualization (optional, requires GLMakie) -------------------------#
 
 try
     using GLMakie
+    include("PlotModel.jl")
     include("PlotModel3D.jl")
-    export depth_slice_viewer, xz_slice_viewer, yz_slice_viewer, grav_3d_viewer, draw_north_and_scale!
+    include("EditModel3D.jl")
+    include("MakeMesh3DGUI.jl")
+    include("PlotData3D.jl")
+    export compute_colorrange, prepare_model_arrays, save_figure
     export PlotModelXY, PlotModelXZ, PlotModelYZ, PlotModelXYZ
-catch err
-    @warn "GLMakie not available, the interactive model viewers are disabled" err
+    export EditModelByLayers, EditModelByDrawing
+    export plot_data, plot_data_fit, PlotDataMap, write_data_gis
+catch LoadError
+    @warn "GLMakie not available, interactive visualization functionality disabled"
 end
 
-#----- Public API ----------------------------------------------------------#
+export Model
+export load_model, load_mesh, write_model
+export air_cells, active_cells, same_mesh
+export load_mask, write_mask, water_mask
+export extract_topography, write_topography, read_topography, air_mask_from_topography, air_mask_from_model
+export Frame, load_frame, to_frame, north_azimuth
+export Data, ndata, load_data_grav, write_data_grav, COMPONENTS
+export rotate_data, drape!, check_frame
+export GravForward, forward, jvec, jtvec, model_vector, model_array, ForwardSolve3D
+export FwdCtrl3D, InvCtrl3D
+export ReadFwdCtrl3D, WriteFwdCtrl3D, ReadInvCtrl3D, WriteInvCtrl3D
+export Invert3D, Inv3DOptions, Inv3DResult, Inv3DProblem, AbstractInversion3D
+export inv3d_tag, inv3d_init, inv3d_prepare!, inv3d_direction, inv3d_reject!, inv3d_accept!, inv3d_info, inv3d_validate
+export LSQR3D, LSQR3DConfig, LSQR3DResult
+export objective, gradient, data_hessian, reg_hessian, phi_d, phi_m, rms, predicted
+export edges_from_centers, core_indices, z_indices_for_max_depth, lateral_core_ranges, core_view
+export detect_shapefile_crs, shapefile_coord_transform, load_shapefile_geometries, prepare_shapefiles, pick_shapefile
+export MakeMesh3D, read_lakes
+export MeshToMesh
 
-export GravData3D, ReadData3D, WriteData3D, data_like, ndata, has_geographic
-export GravModel3D, ReadModel3D, WriteModel3D, model_like, same_mesh, air_mask, cell_volumes, surface_depth, sensor_depth
-export edges_from_centers, core_indices, z_indices_for_max_depth, lateral_core_ranges
-export FwdCtrl3D, ReadFwdCtrl3D, WriteFwdCtrl3D
-export InvCtrl3D, ReadInvCtrl3D, WriteInvCtrl3D
-export InvCtrlINR3D, ReadInvCtrlINR3D, WriteInvCtrlINR3D, ReadInvCtrl
-export Cov3D, ReadCov3D, WriteCov3D
-export GravKernel3D, sensitivity_row, forward3d, Sensitivity3D, SaveSensitivity3D, LoadSensitivity3D, check_receivers, ForwardSolve3D
-export FDCtrl3D, forward3d_fd
-export sphere_anomaly, add_prism!, add_dyke!, add_noise, chi2_rms3d
-export AbstractInversion3D, Inv3DOptions, Inv3DResult, Invert3D, model_weights
-export GaussNewton3DConfig, GaussNewton3DResult, GaussNewton3D
-export INR3DConfig, INR3DResult, INR3D
-export MakeMesh3D, design_mesh, build_mesh_bundle, data_spacing
-export compute_colorrange, prepare_model_arrays, model_slice
-export plot_grav3d_data, plot_inv3d_convergence, PlotData3D
-export GAMMA, SI_TO_MGAL
+export AIR_VALUE, COLORMAP, GAMMA, SI_TO_MGAL
 
 end # module

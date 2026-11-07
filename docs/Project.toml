@@ -9,3 +9,4 @@ GravityGeophysics = {path = ".."}
 [compat]
 Documenter = "1"
 DocumenterVitepress = "0.3"
+GravityGeophysics = "0.4"

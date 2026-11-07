@@ -1,39 +1,41 @@
 name = "GravityGeophysics"
 uuid = "d3c0d1c8-1a54-4e61-9e9a-0c0fbe1d7b7f"
-version = "0.3.0"
-authors = ["Pankaj K Mishra", "and contributors"]
+version = "0.4.0"
+authors = ["JuliaGeophysics", "Pankaj K Mishra <pankajkmishra01@gmail.com>", "and contributors"]
 
 [deps]
+ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
 GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
-JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+GeoInterface = "cf35fbd7-0cd7-5166-be24-54bfbe79505f"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
-NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
-Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Proj = "c94c279d-25a6-4763-9509-64d165bea63e"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Shapefile = "8e980c4a-a4fe-5da2-b3a7-4b4b0353a2f4"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
-Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 
 [compat]
-CairoMakie = "0.14"
+ArchGDAL = "0.10.11"
+CairoMakie = "0.14, 0.15"
 Dates = "1.11"
 GLMakie = "0.12, 0.13"
-JLD2 = "0.6.7"
-Lux = "1.31.4"
-NCDatasets = "0.14.15"
-Optimisers = "0.4.11"
-Proj = "1"
-Zygote = "0.7.14"
+GeoInterface = "1.6.1"
+HCubature = "1"
+LinearAlgebra = "1.12"
+Printf = "1.11"
+Proj = "1.9.0"
+Random = "1.11"
+Shapefile = "0.13.3"
+SparseArrays = "1.12"
+Statistics = "1.11.1"
 julia = "1.13"
 
 [extras]
+HCubature = "19dc6840-f33b-545b-b366-655c7e3ffd49"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["HCubature", "Test"]

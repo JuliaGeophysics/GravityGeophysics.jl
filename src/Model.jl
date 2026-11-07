@@ -1,214 +1,211 @@
-# Density model reader/writer
+# Model file reader/writer and the shared gravity mesh.
 # Author: @pankajkmishra
-# The block layout: nx ny nz 0 LINEAR, cell sizes, layers top down with each
-# layer written row by row (y) and north to south (x reversed), then the origin and rotation
-# Values are density contrasts (kg/m³); air above the topography is NaN in memory and 1e17 on file
-# Depth is zero at the top of the mesh, the highest topography, and positive down; the elevation of that datum is
-# written as the header line "# Top elevation (m) : value"
-
-using Printf
+# x north, y east, z DOWN. On file: header, cell widths, one block per layer with x stored
+# backwards within each y row, then the origin (x, y, z of the first corner) and the rotation.
+# Vertical datum: z = 0 lies at `datum` m above sea level, written as the comment line
+# "# Datum elevation (m) : value". MakeMesh3D puts z = 0 at the highest ground (the top of the highest
+# earth cell); a file without the line (MT, magnetic, older models) has its z = 0 at sea level.
+# Data files keep z = −elevation (sea level); a station's z on the mesh is d.z + datum.
+# Values are LINEAR density contrast in kg/m³; air and inactive cells are NaN in memory and AIR_VALUE
+# on file, read back as NaN above AIR_THRESHOLD, the tag the resistivity files use for air.
 
 #---------- model ----------
 
-"""
-    GravModel3D
+const AIR_VALUE = 1e17        # written for NaN cells
+const AIR_THRESHOLD = 1e15    # read back as NaN above this
 
-A density-contrast model on a tensor mesh, x north, y east, z depth positive down.
-"""
-mutable struct GravModel3D
-    A::Array{Float64, 3}
+# Colour map of every plot: Spectral reversed, blue low to red high
+const COLORMAP = Reverse(:Spectral)
+
+mutable struct Model
+    A::Array{Float64,3}       # density contrast (kg/m³), NaN = air
     dx::Vector{Float64}
     dy::Vector{Float64}
     dz::Vector{Float64}
-    origin::Vector{Float64}
-    top_elevation::Float64
-    x::Vector{Float64}
+    nx::Int
+    ny::Int
+    nz::Int
+    x::Vector{Float64}        # edges
     y::Vector{Float64}
     z::Vector{Float64}
-    cx::Vector{Float64}
+    origin::Vector{Float64}
+    cx::Vector{Float64}       # centres
     cy::Vector{Float64}
     cz::Vector{Float64}
-    npad::NTuple{2, Int}
+    X::Matrix{Float64}
+    Y::Matrix{Float64}
+    Xc::Matrix{Float64}
+    Yc::Matrix{Float64}
+    Z::Matrix{Float64}        # top of the earth in each column
+    npad::NTuple{2,Int}
     name::String
+    niter::String
+    rotation::Float64         # degrees, mesh x clockwise from north
+    datum::Float64            # elevation (m a.s.l.) of z = 0
 end
 
-const GRAV_AIR_VALUE = 1e17          # the air sentinel on file
-const GRAV_AIR_THRESHOLD = 1e15      # values above this read as air
+
+meshgrid(ax::AbstractVector, ay::AbstractVector) = (repeat(reshape(ax, 1, :), length(ay), 1), repeat(reshape(ay, :, 1), 1, length(ax)))
 
 """
-    GravModel3D(dx, dy, dz, A, origin; top_elevation=0.0, name="")
+    Model(dx, dy, dz, A=zeros; origin=[-Σdx/2, -Σdy/2, 0], rotation=0, datum=0, name="")
 
-Model from cell sizes, values and the south-west top corner `(north, east, depth)`; edges, centres and padding are derived.
+Density-contrast model on a tensor mesh, with its derived edge, centre and surface arrays.
+`A[nx, ny, nz]` is density contrast in kg/m³, NaN in air. `datum` is the elevation (m a.s.l.) of z = 0.
 """
-function GravModel3D(dx::AbstractVector{<:Real}, dy::AbstractVector{<:Real}, dz::AbstractVector{<:Real},
-                     A::AbstractArray{<:Real, 3}, origin::AbstractVector{<:Real};
-                     top_elevation::Real = 0.0, name::AbstractString = "")
-    size(A) == (length(dx), length(dy), length(dz)) ||
-        throw(DimensionMismatch("model is $(size(A)) cells, the cell sizes give $((length(dx), length(dy), length(dz)))"))
-    all(>(0), dx) && all(>(0), dy) && all(>(0), dz) || throw(ArgumentError("cell sizes must be positive"))
-    length(origin) == 3 || throw(ArgumentError("origin must hold north, east and depth"))
-    isfinite(top_elevation) || throw(ArgumentError("top elevation must be finite"))
-    x = origin[1] .+ vcat(0.0, cumsum(Float64.(dx)))
-    y = origin[2] .+ vcat(0.0, cumsum(Float64.(dy)))
-    z = origin[3] .+ vcat(0.0, cumsum(Float64.(dz)))
-    centres(e) = (e[1:end-1] .+ e[2:end]) ./ 2
-    GravModel3D(Array{Float64, 3}(A), Float64.(dx), Float64.(dy), Float64.(dz), Float64.(origin), Float64(top_elevation),
-                x, y, z, centres(x), centres(y), centres(z), (_npad(dx), _npad(dy)), String(name))
+function Model(dx::AbstractVector, dy::AbstractVector, dz::AbstractVector,
+               A::AbstractArray{<:Real,3} = zeros(length(dx), length(dy), length(dz));
+               origin::AbstractVector = [-sum(dx)/2, -sum(dy)/2, 0.0], rotation::Real = 0.0, datum::Real = 0.0,
+               name::AbstractString = "", niter::AbstractString = "")
+    nx, ny, nz = length(dx), length(dy), length(dz)
+    all(>(0), dx) && all(>(0), dy) && all(>(0), dz) || throw(ArgumentError("cell widths must be positive"))
+    size(A) == (nx, ny, nz) || throw(ArgumentError("model size $(size(A)) differs from mesh ($nx, $ny, $nz)"))
+    length(origin) == 3 || throw(ArgumentError("origin must have 3 values"))
+    x = vcat(0.0, cumsum(dx)) .+ origin[1]
+    y = vcat(0.0, cumsum(dy)) .+ origin[2]
+    z = vcat(0.0, cumsum(dz)) .+ origin[3]
+    c(e) = (e[1:end-1] .+ e[2:end]) ./ 2
+    cx, cy, cz = c(x), c(y), c(z)
+    X, Y = meshgrid(y, x)
+    Xc, Yc = meshgrid(cy, cx)
+    m = Model(Array{Float64}(A), collect(Float64, dx), collect(Float64, dy), collect(Float64, dz), nx, ny, nz,
+              x, y, z, collect(Float64, origin), cx, cy, cz, X, Y, Xc, Yc, zeros(nx, ny), (0, 0),
+              String(name), String(niter), Float64(rotation), Float64(datum))
+    m.Z = _surface(m)
+    m.npad = _npad(m)
+    m
 end
 
-Base.size(m::GravModel3D) = size(m.A)
-
-# padding cells per side: those wider than the narrowest (core) cell
-function _npad(d)
-    core  = minimum(d)
-    ncore = count(v -> v <= core * (1 + 1e-6), d)
-    (length(d) - ncore) ÷ 2
-end
-
-"""
-    sensor_depth(model, data) -> Vector
-
-Depth (m) of each sensor below the model's depth zero, `top_elevation - elevation`; negative above the top of the mesh.
-"""
-sensor_depth(m::GravModel3D, d) = m.top_elevation .- d.elevation
-
-"""
-    air_mask(model) -> BitArray
-
-Air cells (NaN) of a model.
-"""
-air_mask(m::GravModel3D) = isnan.(m.A)
-
-"""
-    cell_volumes(model) -> Array
-
-Cell volumes (m³) in model order.
-"""
-cell_volumes(m::GravModel3D) = [a * b * c for a in m.dx, b in m.dy, c in m.dz]
-
-"""
-    surface_depth(model) -> Matrix
-
-Depth (m) of the top of the first earth cell in each column, `Inf` for an all-air column.
-"""
-function surface_depth(m::GravModel3D)
-    nx, ny, nz = size(m.A)
-    s = fill(Inf, nx, ny)
-    for i in 1:nx, j in 1:ny
-        k = findfirst(!isnan, view(m.A, i, j, :))
-        k === nothing || (s[i, j] = m.z[k])
+# z of the first earth cell under the top run of air cells; a column of air only keeps the
+# top of its deepest cell
+function _surface(m::Model)
+    Z = zeros(m.nx, m.ny)
+    @inbounds for i in 1:m.nx, j in 1:m.ny
+        ind = something(findlast(isnan, view(m.A, i, j, :)), 0)
+        Z[i, j] = m.z[min(ind, m.nz - 1) + 1]
     end
-    s
+    Z
 end
 
-#---------- reading ----------
-
-"""
-    ReadModel3D(path) -> GravModel3D
-
-Read a density model written by `WriteModel3D` or `MakeMesh3D`.
-"""
-function ReadModel3D(path::AbstractString)
-    isfile(path) || error("model file not found: $path")
-    tokens = String[]
-    header = ""
-    top    = 0.0
-    for raw in eachline(path)
-        stripped = strip(raw)
-        if startswith(stripped, '#')
-            body = strip(stripped[2:end])
-            if occursin(':', body)
-                key, value = strip.(split(body, ':'; limit = 2))
-                _header_key(key) == "top elevation (m)" && (top = parse(Float64, value))
-            end
-            continue
-        end
-        line = strip(first(split(raw, '#')))
-        isempty(line) && continue
-        if isempty(header)
-            header = line
-            continue
-        end
-        append!(tokens, split(line))
-    end
-    h = split(header)
-    length(h) >= 3 && all(t -> tryparse(Int, t) !== nothing, h[1:3]) ||
-        error("$path: expected a header 'nx ny nz nzAir LINEAR'")
-    nx, ny, nz = parse.(Int, h[1:3])
-    nzair = length(h) >= 4 ? something(tryparse(Int, h[4]), 0) : 0
-    kind  = uppercase(length(h) >= 5 ? h[5] : (length(h) >= 4 && tryparse(Int, h[4]) === nothing ? h[4] : "LINEAR"))
-    kind == "LINEAR" || error("$path: density models are LINEAR, got '$kind'")
-    k = 0
-    function next(n)
-        k + n <= length(tokens) || error("$path: model file ends early")
-        v = parse.(Float64, @view tokens[k+1:k+n])
-        k += n
-        v
-    end
-    dx, dy, dz = next(nx), next(ny), next(nz)
-    A = Array{Float64, 3}(undef, nx, ny, nz)
-    for iz in 1:nz
-        A[:, :, iz] = reverse(reshape(next(nx * ny), nx, ny); dims = 1)
-    end
-    origin   = k + 3 <= length(tokens) ? next(3) : [0.0, 0.0, 0.0]
-    rotation = k + 1 <= length(tokens) ? next(1)[1] : 0.0
-    rotation == 0 || @warn "$path: rotation $rotation is ignored, the mesh is taken as north-aligned"
-    A[A .> GRAV_AIR_THRESHOLD] .= NaN
-    nzair == 0 || @warn "$path: $nzair air layers in the header are kept as model layers"
-    GravModel3D(dx, dy, dz, A, origin; top_elevation = top, name = path)
+# padding cells per side: cells whose width differs from the central one
+function _npad(m::Model)
+    cx0 = m.dx[clamp(round(Int, m.nx/2), 1, m.nx)]
+    cy0 = m.dy[clamp(round(Int, m.ny/2), 1, m.ny)]
+    ((m.nx - count(==(cx0), m.dx)) ÷ 2, (m.ny - count(==(cy0), m.dy)) ÷ 2)
 end
 
-#---------- writing ----------
+air_cells(m::Model) = isnan.(m.A)
+active_cells(m::Model) = .!isnan.(m.A)
+
+function same_mesh(a::Model, b::Model)
+    a.dx == b.dx && a.dy == b.dy && a.dz == b.dz && a.origin == b.origin && a.rotation == b.rotation && a.datum == b.datum
+end
+
+#---------- model files ----------
+
+# the datum comment line, 0 (sea level) when absent
+function _datum(raw)
+    for l in raw
+        m = match(r"^\s*#\s*datum elevation \(m\)\s*:\s*(\S+)"i, l)
+        m === nothing || return parse(Float64, m[1])
+    end
+    0.0
+end
+
+function _model_read(path::AbstractString)
+    raw = readlines(path)
+    datum = _datum(raw)
+    lines = [strip(first(split(s, '#'))) for s in raw]
+    filter!(!isempty, lines)
+    isempty(lines) && throw(ArgumentError("empty model file: $path"))
+    h = split(popfirst!(lines))
+    length(h) == 5 || throw(ArgumentError("expected header 'nx ny nz nzAir LINEAR/LOGE/LOG10' in $path"))
+    any(occursin("VALUES", uppercase(t)) for t in h) &&
+        throw(ArgumentError("VALUES-format models are not supported: $path"))
+    nx, ny, nz, nair = parse.(Int, h[1:4])
+    all(>(0), (nx, ny, nz)) && 0 <= nair < nz || throw(ArgumentError("invalid model dimensions in $path"))
+    scale = uppercase(h[5])
+    scale in ("LINEAR", "LOGE", "LOG10") || throw(ArgumentError("unsupported model scale $scale"))
+    tokens = split(join(lines, ' '))
+    n = nx + ny + nz + nx*ny*nz
+    length(tokens) in (n, n+3, n+4) ||
+        throw(ArgumentError("expected $n values (+ origin, rotation) in $path, found $(length(tokens))"))
+    v = parse.(Float64, tokens)
+    all(isfinite, v) || throw(ArgumentError("nonfinite model values in $path"))
+    dx, dy, dz = v[1:nx], v[nx+1:nx+ny], v[nx+ny+1:nx+ny+nz]
+    origin = length(v) >= n+3 ? v[n+1:n+3] : [-sum(dx)/2, -sum(dy)/2, 0.0]
+    rotation = length(v) == n+4 ? v[end] : 0.0
+    A = reverse(reshape(v[nx+ny+nz+1:n], nx, ny, nz); dims = 1)
+    linear = scale == "LINEAR" ? A : scale == "LOGE" ? exp.(A) : exp10.(A)
+    linear[linear .> AIR_THRESHOLD] .= NaN
+    (; dx, dy, dz, A = linear, origin, rotation, datum, nair, scale)
+end
 
 """
-    WriteModel3D(path, model; title="") -> path
+    load_model(path) -> Model
 
-Write a model in the block layout, LINEAR density contrast (kg/m³), air as 1e17, with the top elevation as a header line.
+Read a density model file (LINEAR, kg/m³). Cells above 1e15 are air (NaN).
+Use [`load_mesh`](@ref) to start from a resistivity model.
 """
-function WriteModel3D(path::AbstractString, m::GravModel3D; title::AbstractString = "")
-    nx, ny, nz = size(m.A)
+function load_model(path::AbstractString)
+    r = _model_read(path)
+    r.scale == "LINEAR" ||
+        throw(ArgumentError("density models are LINEAR; $path is $(r.scale), use load_mesh for a resistivity model"))
+    Model(r.dx, r.dy, r.dz, r.A; origin = r.origin, rotation = r.rotation, datum = r.datum, name = path)
+end
+
+"""
+    load_mesh(path; value=0.0, water_log10=NaN) -> Model
+
+Mesh, air cells and rotation of any model file (e.g. a resistivity model with topography),
+filled with density contrast `value` below the surface. Air (> 1e15 Ω·m) stays NaN. Cells with
+log10 ρ < `water_log10` (NaN: off) are set to NaN too: sea water carries no modelled contrast and must not
+be inverted.
+"""
+function load_mesh(path::AbstractString; value::Real = 0.0, water_log10::Real = NaN)
+    r = _model_read(path)
+    A = map(r.A) do rho
+        isnan(rho) || (!isnan(water_log10) && log10(rho) < water_log10) ? NaN : Float64(value)
+    end
+    Model(r.dx, r.dy, r.dz, A; origin = r.origin, rotation = r.rotation, datum = r.datum, name = path)
+end
+
+# top layers made of air only
+_top_air_layers(A) = something(findfirst(k -> !all(isnan, view(A, :, :, k)), axes(A, 3)), size(A, 3)) - 1
+
+"""
+    write_model(path, m; nzAir=<air-only top layers>, comment="")
+
+Write a density model file: header, cell widths, one block per layer with x running
+backwards within each y row, then origin and rotation. Values are LINEAR kg/m³; NaN cells are
+written as $(AIR_VALUE). The datum is written as the line "# Datum elevation (m) : value".
+"""
+function write_model(path::AbstractString, m::Model; nzAir::Integer = _top_air_layers(m.A),
+                           comment::AbstractString = "")
+    size(m.A) == (m.nx, m.ny, m.nz) || throw(ArgumentError("model shape differs from mesh"))
+    all(v -> isnan(v) || isfinite(v), m.A) || throw(ArgumentError("density contrast must be finite or NaN (air)"))
+    0 <= nzAir < m.nz || throw(ArgumentError("invalid air layer count $nzAir"))
     mkpath(dirname(abspath(path)))
     open(path, "w") do io
-        println(io, "# Written by GravityGeophysics.jl WriteModel3D, density contrast (kg/m^3)", isempty(title) ? "" : ", $title")
-        @printf(io, "# Top elevation (m) : %.6f\n", m.top_elevation)
-        println(io, "$nx $ny $nz 0 LINEAR")
-        for d in (m.dx, m.dy, m.dz)
-            foreach(v -> print(io, v, " "), d)
-            println(io)
+        println(io, "# Written by GravityGeophysics.jl write_model (density contrast, kg/m³)",
+                isempty(comment) ? "" : " -- " * comment)
+        println(io, "# Datum elevation (m) : ", m.datum)
+        @printf(io, "%d %d %d %d LINEAR\n", m.nx, m.ny, m.nz, nzAir)
+        for w in (m.dx, m.dy, m.dz)
+            for v in w; print(io, v, " "); end; println(io)
         end
-        for k in 1:nz
+        for k in 1:m.nz
             println(io)
-            for j in 1:ny
-                for i in nx:-1:1
+            for j in 1:m.ny
+                for i in m.nx:-1:1
                     v = m.A[i, j, k]
-                    @printf(io, "%15.6E", isnan(v) ? GRAV_AIR_VALUE : v)
+                    @printf(io, "%17.9E", isnan(v) ? AIR_VALUE : v)
                 end
                 println(io)
             end
         end
         println(io, m.origin[1], " ", m.origin[2], " ", m.origin[3])
-        println(io, 0.0)
+        println(io, m.rotation)
     end
     String(path)
 end
-
-"""
-    model_like(model, values; name=model.name) -> GravModel3D
-
-Copy of a model's mesh with new values (air kept as NaN).
-"""
-function model_like(m::GravModel3D, values::AbstractArray{<:Real, 3}; name::AbstractString = m.name)
-    size(values) == size(m.A) || throw(DimensionMismatch("values are $(size(values)), the model $(size(m.A))"))
-    A = Array{Float64, 3}(values)
-    A[isnan.(m.A)] .= NaN
-    GravModel3D(m.dx, m.dy, m.dz, A, m.origin; top_elevation = m.top_elevation, name)
-end
-
-"""
-    same_mesh(a, b) -> Bool
-
-True when two models share cell sizes, origin and top elevation.
-"""
-same_mesh(a::GravModel3D, b::GravModel3D) =
-    size(a.A) == size(b.A) && a.dx ≈ b.dx && a.dy ≈ b.dy && a.dz ≈ b.dz && a.origin ≈ b.origin &&
-    a.top_elevation ≈ b.top_elevation

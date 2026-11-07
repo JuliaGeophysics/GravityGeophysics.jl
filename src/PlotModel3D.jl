@@ -1,957 +1,2194 @@
-# Interactive 3D density model viewers
+# 3D model viewers: depth slices, XZ and YZ sections and the 3D view, as in the resistivity viewers.
 # Author: @pankajkmishra
-# GLMakie viewers for a density model: depth slices (XY), north-south and east-west sections (XZ and YZ) and
-# the three orthogonal planes together (XYZ). Each has a slider with Prev/Next/First/Last, a core/padding
-# toggle, a zoom reset and an Export Figure button that writes a PNG through CairoMakie
-# PlotModelXY, PlotModelXZ, PlotModelYZ and PlotModelXYZ are the file entries used by the examples
-# Every entry takes one model or a list of label => model pairs, which are drawn side by side on one slider
-# and one colour scale, so a true model and the models recovered by two algorithms share every image
-# Depth is drawn as -z so the mesh top is at the top of every section, with positive depths on the ticks
-# Air cells are NaN in a model and are left transparent, so the topography shows as the edge of the colour
+# Adapted from MTGeophysics.jl to density contrast: values are linear (kg/m³) by default, the colour range is
+# the 2-98 % range of the values shown unless `value_range` is given, and air (NaN) is transparent.
+# Built from Makie blocks; `interactive = true` opens a GLMakie window
+# (`using GLMakie` first), `interactive = false` returns the figure without a display.
 
-using CairoMakie
-using Dates
+# ---------- Shapefile helper functions ----------
 
-const _GRAV_DENSITY_LABEL = "Δρ (kg/m³)"
-const _GRAV_FULL_INFO     = "View: full mesh, padding included"
-const _GRAV_CORE_INFO     = "View: core mesh, padding dropped"
-
-#---------- shared preparation ----------
-
-# centres, edges and values of the full and the core model over the depths to plot
-function _viewer_arrays(M::GravModel3D; max_depth = nothing, pad_tol::Real = 0.2)
-    ix_full, iy_full = 1:length(M.cx), 1:length(M.cy)
-    ix_core, iy_core = lateral_core_ranges(M; tol = pad_tol)
-    kz = max_depth === nothing ? (1:length(M.cz)) : z_indices_for_max_depth(M.cz, float(max_depth))
-    edges(e, r) = e[first(r):last(r)+1]
-    (; kz,
-       z       = M.cz[kz],
-       z_edges = edges(M.z, kz),
-       x_full  = M.cx[ix_full], y_full  = M.cy[iy_full],
-       x_core  = M.cx[ix_core], y_core  = M.cy[iy_core],
-       xe_full = edges(M.x, ix_full), ye_full = edges(M.y, iy_full),
-       xe_core = edges(M.x, ix_core), ye_core = edges(M.y, iy_core),
-       R_full  = M.A[ix_full, iy_full, kz],
-       R_core  = M.A[ix_core, iy_core, kz],
-       ix_full, iy_full, ix_core, iy_core)
+function _is_xy_tuple(c)
+    c isa Tuple && length(c) >= 2 && c[1] isa Real && c[2] isa Real
 end
 
-# one label, model and set of prepared arrays per panel, every model checked against the first mesh
-function _viewer_panels(models::AbstractVector{<:Pair{String, GravModel3D}}; max_depth = nothing,
-                        pad_tol::Real = 0.2)
-    isempty(models) && throw(ArgumentError("no models to plot"))
-    ref = last(first(models))
-    for (label, M) in models
-        same_mesh(M, ref) || @warn "$label is on another mesh; its panel is not cell for cell with the first"
-    end
-    [(; label = first(p), M = last(p), a = _viewer_arrays(last(p); max_depth, pad_tol)) for p in models]
+function _is_xy_vector(c)
+    c isa AbstractVector && length(c) >= 2 && c[1] isa Real && c[2] isa Real
 end
 
-# the colour range shared by every panel, from the strongest contrasts in the core of all of them
-function _panel_colorrange(panels, density_range)
-    pooled = reduce(vcat, (vec(p.a.R_core) for p in panels))
-    compute_colorrange(pooled;
-                       density_range = density_range === nothing ? _body_density_range(pooled) : density_range)
+# ---------- Shapefile CRS detection and reprojection ----------
+# Provided by src/ShapefileOverlay.jl: detect_shapefile_crs,
+# shapefile_coord_transform, load_shapefile_geometries, prepare_shapefiles.
+
+function _plot_coords_recursive!(ax, coords;
+    coord_transform = (x, y) -> (x, y),
+    point_color = :black,
+    line_color  = :black,
+    point_size  = 7,
+    line_width  = 1.5,
+    alpha       = 1.0)
+
+    if _is_xy_tuple(coords) || _is_xy_vector(coords)
+        x, y = coord_transform(Float64(coords[1]), Float64(coords[2]))
+        scatter!(ax, [x], [y], color = (point_color, alpha), markersize = point_size)
+        return 1
+    end
+
+    if coords isa AbstractVector
+        isempty(coords) && return 0
+        first_item = first(coords)
+
+        if _is_xy_tuple(first_item) || _is_xy_vector(first_item)
+            xraw = Float64[p[1] for p in coords if (_is_xy_tuple(p) || _is_xy_vector(p))]
+            yraw = Float64[p[2] for p in coords if (_is_xy_tuple(p) || _is_xy_vector(p))]
+            xy = [coord_transform(xraw[i], yraw[i]) for i in eachindex(xraw)]
+            xs = Float64[p[1] for p in xy]
+            ys = Float64[p[2] for p in xy]
+            npts = length(xs)
+            if npts == 1
+                scatter!(ax, xs, ys, color = (point_color, alpha), markersize = point_size)
+            elseif npts > 1
+                lines!(ax, xs, ys, color = (line_color, alpha), linewidth = line_width)
+            end
+            return npts
+        else
+            count = 0
+            for part in coords
+                count += _plot_coords_recursive!(ax, part;
+                    coord_transform = coord_transform,
+                    point_color = point_color,
+                    line_color  = line_color,
+                    point_size  = point_size,
+                    line_width  = line_width,
+                    alpha       = alpha)
+            end
+            return count
+        end
+    end
+
+    return 0
 end
 
-# true where a reference model on the same mesh holds a body, over the given index ranges
-_outline_mask(outline, M, dims...) = outline === nothing || !same_mesh(outline, M) ? nothing :
-                                     replace(outline.A[dims...], NaN => 0.0) .!= 0
+function _plot_geometry!(ax, geom;
+    coord_transform = (x, y) -> (x, y),
+    point_color = :black,
+    line_color  = :black,
+    point_size  = 7,
+    line_width  = 1.5,
+    alpha       = 1.0)
 
-# positive depths on an axis drawn with negated z
-_grav_depth_tickformat(values) = [string(round(Int, abs(v))) for v in values]
-
-# a slider position as a label; map coordinates stay in metres, however large they are
-_format_position(val::Real) = "$(round(val, digits = 1)) m"
-
-# a bar length as a label, in km past a thousand metres
-_format_length(len::Real) = len >= 1000 ? "$(round(len / 1000, digits = 2)) km" : "$(round(len, digits = 1)) m"
-
-# the staircase of a section's topography as one polyline
-_topography_points(values, he, ve) = (p = _topography_steps(values, he, ve); Point2f.(p[1], p[2]))
-
-# the stations of a survey as open circles with a thin black edge
-_viewer_stations!(ax, station_x, station_y) =
-    isempty(station_x) ? nothing :
-    scatter!(ax, station_y, station_x; color = :transparent, strokecolor = :black,
-             strokewidth = _GRAV_STATION_STROKE, markersize = 5)
-
-# axis keywords of a viewer panel, leaving the ticks automatic where the CRS gives none
-_viewer_axis_kw(xlabel, ylabel, xticks, yticks) =
-    merge((; xlabel, ylabel), xticks === nothing ? NamedTuple() : (; xticks),
-          yticks === nothing ? NamedTuple() : (; yticks))
-
-# where an export goes: the asked-for path, or a timestamped name so repeated exports accumulate
-_export_path(given, dir, model_name, view, tag, full) =
-    given === nothing ?
-    joinpath(dir, "$(model_name)_$(view)_$(tag)_$(full ? "full" : "core")_$(Dates.format(now(), "yyyymmdd_HHMMSS")).png") :
-    String(given)
-
-# a round number near the asked-for length, for a scale bar
-function _nice_scale_length(target::Real)
-    target <= 0 && return 1.0
-    p = 10.0^floor(log10(target))
-    for m in (1.0, 2.0, 5.0)
-        m * p >= target && return m * p
+    coords = try
+        GeoInterface.coordinates(geom)
+    catch
+        nothing
     end
-    10p
+    isnothing(coords) && return 0
+
+    return _plot_coords_recursive!(ax, coords;
+        coord_transform = coord_transform,
+        point_color = point_color,
+        line_color  = line_color,
+        point_size  = point_size,
+        line_width  = line_width,
+        alpha       = alpha)
 end
 
-#---------- depth slices ----------
-
-"""
-    depth_slice_viewer(models; model_name="model", cmap=Reverse(:Spectral), figsize=nothing,
-                       with_padding=false, max_depth=nothing, pad_tol=0.2, density_range=nothing,
-                       show_grid=false, outline=nothing, station_x=Float64[], station_y=Float64[],
-                       axis_xlabel="Y East (m)", axis_ylabel="X North (m)", axis_xticks=nothing,
-                       axis_yticks=nothing, export_dpi=3, export_figsize=nothing,
-                       output_dir=pwd()) -> (fig, parts)
-
-Slider-driven depth slices of one model or of several side by side, east horizontal and north vertical, one layer at a time.
-"""
-function depth_slice_viewer(models::AbstractVector{<:Pair{String, GravModel3D}};
-                            model_name::AbstractString = "model",
-                            cmap = _GRAV_COLORMAP,
-                            figsize = nothing,
-                            with_padding::Bool = false,
-                            max_depth = nothing,
-                            pad_tol::Real = 0.2,
-                            density_range = nothing,
-                            show_grid::Bool = false,
-                            grid_color = :black,
-                            grid_linewidth::Real = 0.5,
-                            grid_alpha::Real = 0.15,
-                            outline::Union{Nothing, GravModel3D} = nothing,
-                            station_x::AbstractVector = Float64[],
-                            station_y::AbstractVector = Float64[],
-                            axis_xlabel::AbstractString = "Y East (m)",
-                            axis_ylabel::AbstractString = "X North (m)",
-                            axis_xticks = nothing,
-                            axis_yticks = nothing,
-                            export_dpi::Int = 3,
-                            export_figsize = nothing,
-                            output_dir::AbstractString = pwd())
-    panels = _viewer_panels(models; max_depth, pad_tol)
-    ncol   = length(panels)
-    nz     = length(first(panels).a.z)
-    edges  = first(panels).a.z_edges
-    cmin, cmax = _panel_colorrange(panels, density_range)
-    start  = cld(nz, 2)                                    # opens on the mesh centre, not an edge layer
-
-    show_full = Observable(with_padding)
-    layer     = Observable(start)
-    state     = [(; p...,
-                    xe       = Ref(with_padding ? p.a.xe_full : p.a.xe_core),
-                    ye       = Ref(with_padding ? p.a.ye_full : p.a.ye_core),
-                    values   = Ref(with_padding ? p.a.R_full  : p.a.R_core),
-                    ranges   = Ref(with_padding ? (p.a.ix_full, p.a.iy_full) : (p.a.ix_core, p.a.iy_core)),
-                    slice    = Observable(permutedims((with_padding ? p.a.R_full : p.a.R_core)[:, :, start])),
-                    segments = Observable(Point2f[]),
-                    ax       = Ref{Any}(nothing)) for p in panels]
-
-    fig   = Figure(size = figsize === nothing ? (520 * ncol + 180, 950) : figsize, fontsize = 16)
-    title = Observable(" ")
-    Label(fig[0, 1:ncol+1], title, fontsize = 18, font = :bold)
-    for (c, s) in enumerate(state)
-        s.ax[] = _grav_axis(fig[1, c];
-                            merge(_viewer_axis_kw(axis_xlabel, axis_ylabel, axis_xticks, axis_yticks),
-                                  (; ylabel = c == 1 ? axis_ylabel : ""))...,
-                            aspect = DataAspect(), title = ncol > 1 ? s.label : "")
+function _draw_all_shapefiles!(ax, loaded_shapefiles)
+    total = 0
+    for shp in loaded_shapefiles
+        ct = shp.coord_transform
+        for geom in shp.geoms
+            total += _plot_geometry!(ax, geom;
+                coord_transform = ct,
+                point_color = shp.color,
+                line_color  = shp.color,
+                point_size  = shp.point_size,
+                line_width  = shp.line_width,
+                alpha       = shp.alpha)
+        end
     end
-    Colorbar(fig[1, ncol+1]; colormap = cmap, colorrange = (cmin, cmax), label = _GRAV_DENSITY_LABEL,
-             width = 16, height = Relative(0.8))
+    return total
+end
 
-    reset_zoom!() = for s in state
-        limits!(s.ax[], s.ye[][1], s.ye[][end], s.xe[][1], s.xe[][end])
-    end
+# ---------- Main viewer function ----------
 
-    # the heatmap and the outline follow their observables, so only a view change redraws the axes
-    draw_axes! = function ()
-        for s in state
-            ax = s.ax[]
-            empty!(ax)
-            heatmap!(ax, s.ye[], s.xe[], s.slice; colormap = cmap, colorrange = (cmin, cmax),
-                     nan_color = :transparent)
-            linesegments!(ax, s.segments; color = :black, linewidth = _GRAV_OUTLINE_WIDTH)
-            _viewer_stations!(ax, station_x, station_y)
-            if show_grid
-                for v in s.xe[]
-                    lines!(ax, [s.ye[][1], s.ye[][end]], [v, v]; color = (grid_color, grid_alpha),
-                           linewidth = grid_linewidth)
-                end
-                for v in s.ye[]
-                    lines!(ax, [v, v], [s.xe[][1], s.xe[][end]]; color = (grid_color, grid_alpha),
-                           linewidth = grid_linewidth)
-                end
+function depth_slice_viewer(
+    M;
+    export_dir::String = "",
+    model_name::String = "model",
+    log10scale::Bool = false,
+    cmap = COLORMAP,
+    figsize = (1100, 950),
+    withPadding::Bool = true,
+    max_depth::Union{Nothing, Real} = nothing,
+    pad_tol::Real = 0.2,
+    value_range::Union{Nothing, Tuple{<:Real,<:Real}} = nothing,
+    show_grid::Bool = true,
+    grid_color = :black,
+    grid_linewidth::Real = 0.5,
+    grid_alpha::Real = 0.3,
+    axis_xlabel::String = "Y (m)",
+    axis_ylabel::String = "X (m)",
+    axis_aspect::Union{Nothing, Real} = nothing,
+    geographic::Bool = false,
+    loaded_shapefiles = [],
+    export_dpi::Int = 3,
+    export_figsize = (1100, 900),
+    custom_extent = nothing,
+    export_crs::String = "model",
+    gis_output_dir::String = "",
+    site_x::Vector{Float64} = Float64[],
+    site_y::Vector{Float64} = Float64[]
+)
+    x_all = M.cx
+    y_all = M.cy
+    z_all, ze_all, z_top = _depths(M)                  # depth below the top of the topography, positive down
+    A_all = log10scale ? log10.(M.A) : copy(M.A)
+
+    ix_full = 1:length(x_all)
+    iy_full = 1:length(y_all)
+    ix_core, iy_core = _core_indices_or_extent(x_all, y_all; pad_tol = pad_tol, extent = custom_extent)
+
+    kz = _depth_layers(ze_all, max_depth)
+    z = z_all[kz]
+
+    x_full = x_all[ix_full]
+    y_full = y_all[iy_full]
+    R_full = A_all[ix_full, iy_full, kz]
+
+    x_core = x_all[ix_core]
+    y_core = y_all[iy_core]
+    R_core = A_all[ix_core, iy_core, kz]
+
+    x_edges_full = edges_from_centers(x_full)
+    y_edges_full = edges_from_centers(y_full)
+    x_edges_core = edges_from_centers(x_core)
+    y_edges_core = edges_from_centers(y_core)
+    z_edges = ze_all[first(kz):last(kz)+1]
+
+    layer_depths = z_edges[2:end]                      # bottom of each layer
+
+    cmin, cmax = compute_colorrange(R_full; value_range)
+
+    show_full_model = Observable(withPadding)
+
+    current_x_edges = Observable(withPadding ? x_edges_full : x_edges_core)
+    current_y_edges = Observable(withPadding ? y_edges_full : y_edges_core)
+    current_R = withPadding ? R_full : R_core
+
+    fig = Figure(size = figsize)
+
+    title_str = Observable("Depth Layer 1 / $(length(z)) | Depth: $(round(z_edges[1], digits=1)) - $(round(z_edges[2], digits=1)) m")
+    Label(fig[0, 1:2], title_str, fontsize = 18, font = :bold)
+
+    ax_aspect = isnothing(axis_aspect) ? DataAspect() : AxisAspect(Float64(axis_aspect))
+
+    ax = Axis(fig[1, 1],
+        xlabel = axis_xlabel,
+        ylabel = axis_ylabel,
+        aspect = ax_aspect,
+        title = "",
+        xtickformat = _plain_tickformat,
+        ytickformat = _plain_tickformat
+    )
+
+    current_layer = Observable(1)
+    slice_data = Observable(current_R[:, :, 1]')
+
+    current_colormap = Observable(cmap)
+
+    hm = heatmap!(ax, current_y_edges[], current_x_edges[], slice_data,
+                  colormap = current_colormap,
+                  colorrange = (cmin, cmax))
+
+    isempty(site_x) || scatter!(ax, site_x, site_y; color = :black, marker = :circle, markersize = 4)
+
+    grid_plots = Ref{Vector{Any}}([])
+
+    function draw_grid!(ax, x_edges, y_edges)
+        for p in grid_plots[]
+            delete!(ax, p)
+        end
+        grid_plots[] = []
+
+        if show_grid
+            for xe in x_edges
+                p = lines!(ax, [y_edges[1], y_edges[end]], [xe, xe],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+                push!(grid_plots[], p)
+            end
+            for ye in y_edges
+                p = lines!(ax, [ye, ye], [x_edges[1], x_edges[end]],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+                push!(grid_plots[], p)
             end
         end
+    end
+
+    draw_grid!(ax, current_x_edges[], current_y_edges[])
+
+    # Draw shapefile overlays on the interactive axis
+    _draw_all_shapefiles!(ax, loaded_shapefiles)
+
+    # Constrain initial view to the model extent (shapefiles may extend beyond)
+    xe_init = current_x_edges[]
+    ye_init = current_y_edges[]
+    limits!(ax, ye_init[1], ye_init[end], xe_init[1], xe_init[end])
+
+    cb_label = _value_label(log10scale)
+    Colorbar(fig[1, 2], hm, label = cb_label)
+
+    slider_grid = fig[2, 1:2] = GridLayout()
+
+    btn_prev = Button(slider_grid[1, 1], label = "<< Prev")
+    Label(slider_grid[1, 2], "Depth Layer:", fontsize = 14)
+    sl = Slider(slider_grid[1, 3], range = 1:length(z), startvalue = 1, width = 400)
+    layer_label = Observable("1 / $(length(z))")
+    Label(slider_grid[1, 4], layer_label, fontsize = 14)
+    btn_next = Button(slider_grid[1, 5], label = "Next >>")
+
+    button_grid = fig[3, 1:2] = GridLayout()
+
+    btn_first = Button(button_grid[1, 1], label = "|<< First")
+    btn_last  = Button(button_grid[1, 2], label = "Last >>|")
+
+    btn_label  = Observable(withPadding ? "Show Core Model" : "Show Full Model")
+    btn_toggle = Button(button_grid[1, 3], label = btn_label)
+
+    btn_reset  = Button(button_grid[1, 4], label = "Reset Zoom")
+    btn_export = Button(button_grid[1, 5], label = "Export Figure")
+    btn_export_gis = Button(button_grid[1, 6], label = "Export GIS")
+
+    info_grid = fig[4, 1:2] = GridLayout()
+    depth_info = Observable("Layer depth range: $(round(z_edges[1], digits=1)) - $(round(z_edges[2], digits=1)) m | Cell thickness: $(round(diff(z_edges)[1], digits=1)) m")
+    Label(info_grid[1, 1], depth_info, fontsize = 12)
+
+    n_shp = length(loaded_shapefiles)
+    full_view_str = n_shp > 0 ? "View: Full Model | Shapefiles loaded: $n_shp" : "View: Full Model (with padding)"
+    core_view_str = n_shp > 0 ? "View: Core Model | Shapefiles loaded: $n_shp" : "View: Core Model (no padding)"
+    view_info = Observable(withPadding ? full_view_str : core_view_str)
+    Label(info_grid[1, 2], view_info, fontsize = 12, color = :blue)
+
+    current_R_ref = Ref(current_R)
+
+    function reset_zoom!()
+        xe = current_x_edges[]
+        ye = current_y_edges[]
+        limits!(ax, ye[1], ye[end], xe[1], xe[end])
+    end
+
+    function update_view!(show_full::Bool)
+        if show_full
+            current_x_edges[] = x_edges_full
+            current_y_edges[] = y_edges_full
+            current_R_ref[] = R_full
+            btn_label[] = "Show Core Model"
+            view_info[] = full_view_str
+        else
+            current_x_edges[] = x_edges_core
+            current_y_edges[] = y_edges_core
+            current_R_ref[] = R_core
+            btn_label[] = "Show Full Model"
+            view_info[] = core_view_str
+        end
+
+        layer_idx = current_layer[]
+        slice_data[] = current_R_ref[][:, :, layer_idx]'
+
+        empty!(ax)
+        hm = heatmap!(ax, current_y_edges[], current_x_edges[], slice_data,
+                      colormap = current_colormap,
+                      colorrange = (cmin, cmax))
+
+        isempty(site_x) || scatter!(ax, site_x, site_y; color = :black, marker = :circle, markersize = 4)
+
+        draw_grid!(ax, current_x_edges[], current_y_edges[])
+
+        # Redraw shapefiles after empty!()
+        _draw_all_shapefiles!(ax, loaded_shapefiles)
+
+        # Recompute the distance-faithful aspect for the new extent (degrees axes)
+        if geographic
+            asp, _ = _distance_based_aspect(collect(current_x_edges[]), collect(current_y_edges[]))
+            ax.aspect = AxisAspect(Float64(asp))
+        end
+
         reset_zoom!()
     end
 
-    update_slice! = function (k)
-        k       = clamp(k, 1, nz)
-        layer[] = k
-        for s in state
-            s.slice[]    = permutedims(s.values[][:, :, k])
-            mask         = _outline_mask(outline, s.M, s.ranges[][1], s.ranges[][2], s.a.kz[k])
-            s.segments[] = mask === nothing ? Point2f[] : _cell_outline(permutedims(mask), s.ye[], s.xe[])
-        end
-        top, bot = edges[k], edges[k+1]
-        title[]  = @sprintf("Depth layer %d / %d  |  %.0f to %.0f m  |  cell %.0f m", k, nz, top, bot, bot - top)
+    function update_slice(layer_idx)
+        layer_idx = clamp(layer_idx, 1, length(z))
+        current_layer[] = layer_idx
+        slice_data[] = current_R_ref[][:, :, layer_idx]'
+
+        layer_label[] = "$layer_idx / $(length(z))"
+
+        depth_top, depth_bottom = z_edges[layer_idx], z_edges[layer_idx + 1]
+        thickness = diff(z_edges)[layer_idx]
+
+        title_str[] = "Depth Layer $layer_idx / $(length(z)) | Depth: $(round(depth_top, digits=1)) - $(round(depth_bottom, digits=1)) m"
+        depth_info[] = "Layer depth range: $(round(depth_top, digits=1)) - $(round(depth_bottom, digits=1)) m | Cell thickness: $(round(thickness, digits=1)) m"
     end
 
-    update_slice!(start)
-    draw_axes!()
-
-    bar      = fig[2, 1:ncol+1] = GridLayout()
-    btn_prev = Button(bar[1, 1], label = "<< Prev")
-    Label(bar[1, 2], "Depth layer:")
-    slider   = Slider(bar[1, 3], range = 1:nz, startvalue = start, width = 400)
-    count    = Observable("$start / $nz")
-    Label(bar[1, 4], count)
-    btn_next = Button(bar[1, 5], label = "Next >>")
-
-    row        = fig[3, 1:ncol+1] = GridLayout()
-    btn_first  = Button(row[1, 1], label = "|<< First")
-    btn_last   = Button(row[1, 2], label = "Last >>|")
-    btn_label  = Observable(with_padding ? "Show core" : "Show full")
-    btn_toggle = Button(row[1, 3], label = btn_label)
-    btn_reset  = Button(row[1, 4], label = "Reset zoom")
-    btn_export = Button(row[1, 5], label = "Export figure")
-    view_info  = Observable(with_padding ? _GRAV_FULL_INFO : _GRAV_CORE_INFO)
-    Label(fig[4, 1:ncol+1], view_info, fontsize = 12, color = :gray35)
-
-    on(slider.value) do k
-        count[] = "$k / $nz"
-        update_slice!(k)
+    on(sl.value) do val
+        update_slice(val)
     end
-    on(btn_prev.clicks)  do _; set_close_to!(slider, max(1, slider.value[] - 1)) end
-    on(btn_next.clicks)  do _; set_close_to!(slider, min(nz, slider.value[] + 1)) end
-    on(btn_first.clicks) do _; set_close_to!(slider, 1) end
-    on(btn_last.clicks)  do _; set_close_to!(slider, nz) end
-    on(btn_reset.clicks) do _; reset_zoom!() end
+
+    on(btn_prev.clicks) do _
+        set_close_to!(sl, max(1, sl.value[] - 1))
+    end
+
+    on(btn_next.clicks) do _
+        set_close_to!(sl, min(length(z), sl.value[] + 1))
+    end
+
+    on(btn_first.clicks) do _
+        set_close_to!(sl, 1)
+    end
+
+    on(btn_last.clicks) do _
+        set_close_to!(sl, length(z))
+    end
+
     on(btn_toggle.clicks) do _
-        show_full[] = !show_full[]
-        for s in state
-            s.xe[]     = show_full[] ? s.a.xe_full : s.a.xe_core
-            s.ye[]     = show_full[] ? s.a.ye_full : s.a.ye_core
-            s.values[] = show_full[] ? s.a.R_full  : s.a.R_core
-            s.ranges[] = show_full[] ? (s.a.ix_full, s.a.iy_full) : (s.a.ix_core, s.a.iy_core)
-        end
-        btn_label[] = show_full[] ? "Show core" : "Show full"
-        view_info[] = show_full[] ? _GRAV_FULL_INFO : _GRAV_CORE_INFO
-        update_slice!(layer[])
-        draw_axes!()
+        show_full_model[] = !show_full_model[]
+        update_view!(show_full_model[])
     end
 
-    export_figure = function (output_path = nothing)
-        f = Figure(size = export_figsize === nothing ? (520 * ncol + 180, 620) : export_figsize, fontsize = 18)
-        Label(f[1, 1:ncol+1], title[], fontsize = 20, font = :bold)
-        for (c, s) in enumerate(state)
-            exax = _grav_axis(f[2, c];
-                              merge(_viewer_axis_kw(axis_xlabel, axis_ylabel, axis_xticks, axis_yticks),
-                                    (; ylabel = c == 1 ? axis_ylabel : ""))...,
-                              aspect = DataAspect(), title = ncol > 1 ? s.label : "")
-            heatmap!(exax, s.ye[], s.xe[], s.slice[]; colormap = cmap, colorrange = (cmin, cmax),
-                     nan_color = :transparent)
-            isempty(s.segments[]) || linesegments!(exax, s.segments[]; color = :black,
-                                                   linewidth = _GRAV_OUTLINE_WIDTH)
-            _viewer_stations!(exax, station_x, station_y)
-            limits!(exax, s.ye[][1], s.ye[][end], s.xe[][1], s.xe[][end])
-        end
-        Colorbar(f[2, ncol+1]; colormap = cmap, colorrange = (cmin, cmax), label = _GRAV_DENSITY_LABEL,
-                 width = 16, height = Relative(0.8))
-        path = _export_path(output_path, output_dir, model_name, "XY", "layer$(layer[])", show_full[])
-        mkpath(dirname(abspath(path)))
-        save(path, f; px_per_unit = export_dpi, backend = CairoMakie)
-        println("Figure exported: $path")
-        path
-    end
-    on(btn_export.clicks) do _; export_figure() end
-
-    fig, (; axes = [s.ax[] for s in state], ax = first(state).ax[], slider, layer,
-            slice = first(state).slice, slices = [s.slice for s in state],
-            segments = first(state).segments, show_full, z = first(panels).a.z, z_edges = edges,
-            colorrange = (; cmin, cmax), reset_zoom!, export_figure)
-end
-
-depth_slice_viewer(M::GravModel3D; model_name::AbstractString = "model", kwargs...) =
-    depth_slice_viewer([String(model_name) => M]; model_name, kwargs...)
-
-#---------- sections ----------
-
-# one section viewer, for a north-south (:xz) or an east-west (:yz) cut
-function _section_viewer(models::AbstractVector{<:Pair{String, GravModel3D}}, view::Symbol;
-                         model_name::AbstractString = "model",
-                         cmap = _GRAV_COLORMAP,
-                         figsize = nothing,
-                         with_padding::Bool = false,
-                         max_depth = nothing,
-                         pad_tol::Real = 0.2,
-                         density_range = nothing,
-                         show_grid::Bool = false,
-                         grid_color = :black,
-                         grid_linewidth::Real = 0.5,
-                         grid_alpha::Real = 0.15,
-                         outline::Union{Nothing, GravModel3D} = nothing,
-                         show_topography::Bool = true,
-                         horiz_label::AbstractString = view == :xz ? "X North (m)" : "Y East (m)",
-                         horiz_ticks = nothing,
-                         slider_label::AbstractString = view == :xz ? "East" : "North",
-                         export_dpi::Int = 3,
-                         export_figsize = nothing,
-                         output_dir::AbstractString = pwd())
-    view in (:xz, :yz) || throw(ArgumentError("view must be :xz or :yz"))
-    panels = _viewer_panels(models; max_depth, pad_tol)
-    ncol   = length(panels)
-    neg    = -first(panels).a.z_edges                      # depth drawn downward from the mesh top
-    cmin, cmax = _panel_colorrange(panels, density_range)
-
-    # the slider runs across the section: east for :xz, north for :yz
-    across_of(a, full) = view == :xz ? (full ? a.y_full : a.y_core) : (full ? a.x_full : a.x_core)
-    along_of(a, full)  = view == :xz ? (full ? a.xe_full : a.xe_core) : (full ? a.ye_full : a.ye_core)
-    cut(R, k)          = view == :xz ? R[:, k, :] : R[k, :, :]
-
-    start = cld(length(across_of(first(panels).a, with_padding)), 2)   # opens on the mesh centre, not an edge
-
-    show_full = Observable(with_padding)
-    index     = Observable(start)
-    state     = [(; p...,
-                    he       = Ref(along_of(p.a, with_padding)),
-                    values   = Ref(with_padding ? p.a.R_full : p.a.R_core),
-                    across   = Ref(across_of(p.a, with_padding)),
-                    ranges   = Ref(with_padding ? (p.a.ix_full, p.a.iy_full) : (p.a.ix_core, p.a.iy_core)),
-                    slice    = Observable(cut(with_padding ? p.a.R_full : p.a.R_core, start)),
-                    segments = Observable(Point2f[]),
-                    topo     = Observable(Point2f[]),
-                    ax       = Ref{Any}(nothing)) for p in panels]
-    nacross() = length(first(state).across[])
-
-    fig   = Figure(size = figsize === nothing ? (560 * ncol + 180, 950) : figsize, fontsize = 16)
-    title = Observable(" ")
-    Label(fig[0, 1:ncol+1], title, fontsize = 18, font = :bold)
-    for (c, s) in enumerate(state)
-        s.ax[] = _grav_axis(fig[1, c];
-                            merge(_viewer_axis_kw(horiz_label, "Depth (m)", horiz_ticks, nothing),
-                                  (; ylabel = c == 1 ? "Depth (m)" : ""))...,
-                            ytickformat = _grav_depth_tickformat, title = ncol > 1 ? s.label : "")
-    end
-    Colorbar(fig[1, ncol+1]; colormap = cmap, colorrange = (cmin, cmax), label = _GRAV_DENSITY_LABEL,
-             width = 16, height = Relative(0.8))
-
-    reset_zoom!() = for s in state
-        limits!(s.ax[], s.he[][1], s.he[][end], neg[end], neg[1])
-    end
-
-    draw_axes! = function ()
-        for s in state
-            ax = s.ax[]
-            empty!(ax)
-            heatmap!(ax, s.he[], neg, s.slice; colormap = cmap, colorrange = (cmin, cmax),
-                     nan_color = :transparent)
-            linesegments!(ax, s.segments; color = :black, linewidth = _GRAV_OUTLINE_WIDTH)
-            show_topography && lines!(ax, s.topo; color = :black, linewidth = _GRAV_TOPO_WIDTH)
-            if show_grid
-                for v in neg
-                    lines!(ax, [s.he[][1], s.he[][end]], [v, v]; color = (grid_color, grid_alpha),
-                           linewidth = grid_linewidth)
-                end
-                for v in s.he[]
-                    lines!(ax, [v, v], [neg[end], neg[1]]; color = (grid_color, grid_alpha),
-                           linewidth = grid_linewidth)
-                end
-            end
-        end
+    on(btn_reset.clicks) do _
         reset_zoom!()
     end
 
-    update_slice! = function (k)
-        k       = clamp(k, 1, nacross())
-        index[] = k
-        for s in state
-            s.slice[] = cut(s.values[], k)
-            mask      = view == :xz ? _outline_mask(outline, s.M, s.ranges[][1], s.ranges[][2][k], s.a.kz) :
-                                      _outline_mask(outline, s.M, s.ranges[][1][k], s.ranges[][2], s.a.kz)
-            s.segments[] = mask === nothing ? Point2f[] : _cell_outline(mask, s.he[], neg)
-            s.topo[]     = show_topography ? _topography_points(s.slice[], s.he[], neg) : Point2f[]
+    function export_figure()
+        layer_idx = current_layer[]
+
+        depth_top, depth_bottom = z_edges[layer_idx], z_edges[layer_idx + 1]
+
+        xe = current_x_edges[]
+        ye = current_y_edges[]
+        data = slice_data[]
+        cmap_val = current_colormap[]
+
+        export_fig = Figure(size = export_figsize, fontsize = 16)
+
+        depth_str = if depth_bottom < 1000
+            "Depth: $(round(depth_top, digits=1)) - $(round(depth_bottom, digits=1)) m"
+        else
+            "Depth: $(round(depth_top/1000, digits=2)) - $(round(depth_bottom/1000, digits=2)) km"
         end
-        title[] = @sprintf("%s section %d / %d  |  %s = %s", slider_label, k, nacross(), slider_label,
-                           _format_position(first(state).across[][k]))
-    end
+        Label(export_fig[1, 1:2], "Layer $layer_idx | $depth_str",
+              fontsize = 20, font = :bold)
 
-    update_slice!(start)
-    draw_axes!()
-
-    bar      = fig[2, 1:ncol+1] = GridLayout()
-    btn_prev = Button(bar[1, 1], label = "<< Prev")
-    Label(bar[1, 2], "$(slider_label) slice:")
-    slider   = Slider(bar[1, 3], range = 1:nacross(), startvalue = start, width = 400)
-    count    = Observable("$start / $(nacross())")
-    Label(bar[1, 4], count)
-    btn_next = Button(bar[1, 5], label = "Next >>")
-
-    row        = fig[3, 1:ncol+1] = GridLayout()
-    btn_first  = Button(row[1, 1], label = "|<< First")
-    btn_last   = Button(row[1, 2], label = "Last >>|")
-    btn_label  = Observable(with_padding ? "Show core" : "Show full")
-    btn_toggle = Button(row[1, 3], label = btn_label)
-    btn_reset  = Button(row[1, 4], label = "Reset zoom")
-    btn_export = Button(row[1, 5], label = "Export figure")
-    view_info  = Observable(with_padding ? _GRAV_FULL_INFO : _GRAV_CORE_INFO)
-    Label(fig[4, 1:ncol+1], view_info, fontsize = 12, color = :gray35)
-
-    on(slider.value) do k
-        count[] = "$k / $(nacross())"
-        update_slice!(k)
-    end
-    on(btn_prev.clicks)  do _; set_close_to!(slider, max(1, slider.value[] - 1)) end
-    on(btn_next.clicks)  do _; set_close_to!(slider, min(nacross(), slider.value[] + 1)) end
-    on(btn_first.clicks) do _; set_close_to!(slider, 1) end
-    on(btn_last.clicks)  do _; set_close_to!(slider, nacross()) end
-    on(btn_reset.clicks) do _; reset_zoom!() end
-    on(btn_toggle.clicks) do _
-        show_full[] = !show_full[]
-        for s in state
-            s.he[]     = along_of(s.a, show_full[])
-            s.values[] = show_full[] ? s.a.R_full : s.a.R_core
-            s.across[] = across_of(s.a, show_full[])
-            s.ranges[] = show_full[] ? (s.a.ix_full, s.a.iy_full) : (s.a.ix_core, s.a.iy_core)
+        export_aspect = ax_aspect
+        if geographic
+            asp, _ = _distance_based_aspect(collect(xe), collect(ye))
+            export_aspect = AxisAspect(Float64(asp))
         end
-        btn_label[]    = show_full[] ? "Show core" : "Show full"
-        view_info[]    = show_full[] ? _GRAV_FULL_INFO : _GRAV_CORE_INFO
-        slider.range[] = 1:nacross()
-        update_slice!(clamp(index[], 1, nacross()))
-        draw_axes!()
-    end
 
-    export_figure = function (output_path = nothing)
-        f = Figure(size = export_figsize === nothing ? (560 * ncol + 180, 560) : export_figsize, fontsize = 18)
-        Label(f[1, 1:ncol+1], title[], fontsize = 20, font = :bold)
-        for (c, s) in enumerate(state)
-            exax = _grav_axis(f[2, c];
-                              merge(_viewer_axis_kw(horiz_label, "Depth (m)", horiz_ticks, nothing),
-                                    (; ylabel = c == 1 ? "Depth (m)" : ""))...,
-                              ytickformat = _grav_depth_tickformat, title = ncol > 1 ? s.label : "")
-            heatmap!(exax, s.he[], neg, s.slice[]; colormap = cmap, colorrange = (cmin, cmax),
-                     nan_color = :transparent)
-            isempty(s.segments[]) || linesegments!(exax, s.segments[]; color = :black,
-                                                   linewidth = _GRAV_OUTLINE_WIDTH)
-            isempty(s.topo[]) || lines!(exax, s.topo[]; color = :black, linewidth = _GRAV_TOPO_WIDTH)
-            limits!(exax, s.he[][1], s.he[][end], neg[end], neg[1])
+        export_ax = Axis(export_fig[2, 1],
+            xlabel = axis_xlabel,
+            ylabel = axis_ylabel,
+            aspect = export_aspect,
+            xlabelsize = 16,
+            ylabelsize = 16,
+            xticklabelsize = 12,
+            yticklabelsize = 12,
+            xtickformat = _plain_tickformat,
+            ytickformat = _plain_tickformat
+        )
+
+        export_hm = heatmap!(export_ax, ye, xe, data,
+                            colormap = cmap_val,
+                            colorrange = (cmin, cmax))
+
+        isempty(site_x) || scatter!(export_ax, site_x, site_y; color = :black, marker = :circle, markersize = 4)
+
+        if show_grid
+            for x_edge in xe
+                lines!(export_ax, [ye[1], ye[end]], [x_edge, x_edge],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+            end
+            for y_edge in ye
+                lines!(export_ax, [y_edge, y_edge], [xe[1], xe[end]],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+            end
         end
-        Colorbar(f[2, ncol+1]; colormap = cmap, colorrange = (cmin, cmax), label = _GRAV_DENSITY_LABEL,
-                 width = 16, height = Relative(0.8))
-        path = _export_path(output_path, output_dir, model_name, uppercase(string(view)),
-                            "slice$(index[])", show_full[])
-        mkpath(dirname(abspath(path)))
-        save(path, f; px_per_unit = export_dpi, backend = CairoMakie)
-        println("Figure exported: $path")
-        path
-    end
-    on(btn_export.clicks) do _; export_figure() end
 
-    fig, (; axes = [s.ax[] for s in state], ax = first(state).ax[], slider, index,
-            slice = first(state).slice, slices = [s.slice for s in state],
-            segments = first(state).segments, topo = first(state).topo, show_full,
-            z = first(panels).a.z, z_edges = first(panels).a.z_edges,
-            colorrange = (; cmin, cmax), reset_zoom!, export_figure)
+        # Shapefile overlay on export
+        _draw_all_shapefiles!(export_ax, loaded_shapefiles)
+
+        # Clip export axes to the current view extent
+        limits!(export_ax, ye[1], ye[end], xe[1], xe[end])
+
+        cb_lbl = _value_label(log10scale)
+        Colorbar(export_fig[2, 2], export_hm, label = cb_lbl, labelsize = 16, ticklabelsize = 12)
+
+        colsize!(export_fig.layout, 2, Relative(0.05))
+
+        view_type = show_full_model[] ? "full" : "core"
+        timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
+        filename = "$(model_name)_XY_layer$(layer_idx)_$(view_type)_$(timestamp).png"
+        filename = joinpath(isempty(export_dir) ? pwd() : export_dir, filename)
+
+        save(filename, export_fig, px_per_unit = export_dpi)
+
+        w_px = round(Int, export_figsize[1] * export_dpi)
+        h_px = round(Int, export_figsize[2] * export_dpi)
+
+        println("Figure exported: $filename")
+        println("  Resolution: $(w_px) × $(h_px) pixels")
+        println("  Layer: $layer_idx, $depth_str")
+
+        return filename
+    end
+
+    on(btn_export.clicks) do _
+        export_figure()
+    end
+
+    function export_gis_all()
+        # Determine which view to export
+        xe = current_x_edges[]
+        ye = current_y_edges[]
+        R_export = current_R_ref[]
+
+        gis_dir = isempty(gis_output_dir) ? joinpath(isempty(export_dir) ? pwd() : export_dir, "$(model_name)-GIS") : gis_output_dir
+
+        _export_all_depth_slices_gis(
+            output_dir     = gis_dir,
+            model_name     = model_name,
+            x_edges        = xe,
+            y_edges        = ye,
+            R              = R_export,
+            z_edges        = z_edges,
+            crs            = export_crs,
+            log10scale     = log10scale,
+            vis_range      = (cmin, cmax)
+        )
+
+        view_info[] = "GIS exported: $(basename(gis_dir))/ ($(size(R_export, 3)) layers)"
+    end
+
+    on(btn_export_gis.clicks) do _
+        try
+            export_gis_all()
+        catch err
+            view_info[] = "GIS export failed: $(err)"
+            println("GIS export error: ", err)
+        end
+    end
+
+    return fig, (
+        ax = ax,
+        heatmap = hm,
+        slider = sl,
+        current_layer = current_layer,
+        slice_data = slice_data,
+        show_full_model = show_full_model,
+        R_full = R_full,
+        R_core = R_core,
+        x_full = x_full, y_full = y_full,
+        x_core = x_core, y_core = y_core,
+        z = z,
+        x_edges_full = x_edges_full, y_edges_full = y_edges_full,
+        x_edges_core = x_edges_core, y_edges_core = y_edges_core,
+        z_edges = z_edges,
+        layer_depths = layer_depths,
+        colorrange = (cmin = cmin, cmax = cmax),
+        reset_zoom! = reset_zoom!
+    )
 end
 
-"""
-    xz_slice_viewer(models; kwargs...) -> (fig, parts)
+# ---------- Main ----------
 
-Slider-driven north-south sections of one or several density models, the slider stepping east through the mesh.
-"""
-xz_slice_viewer(models::AbstractVector{<:Pair{String, GravModel3D}}; kwargs...) =
-    _section_viewer(models, :xz; kwargs...)
+# ---------- Format slider value for display ----------
 
-xz_slice_viewer(M::GravModel3D; model_name::AbstractString = "model", kwargs...) =
-    _section_viewer([String(model_name) => M], :xz; model_name, kwargs...)
+function _format_slider_val(val::Real, unit::AbstractString)
+    if unit == "°"
+        return "$(round(val, digits=5))°"
+    else
+        if abs(val) >= 1_000_000
+            return "$(round(val/1000, digits=1)) km"
+        elseif abs(val) >= 1000
+            return "$(round(val, digits=0)) m"
+        else
+            return "$(round(val, digits=1)) m"
+        end
+    end
+end
 
-"""
-    yz_slice_viewer(models; kwargs...) -> (fig, parts)
+# ---------- Main viewer function ----------
 
-Slider-driven east-west sections of one or several density models, the slider stepping north through the mesh.
-"""
-yz_slice_viewer(models::AbstractVector{<:Pair{String, GravModel3D}}; kwargs...) =
-    _section_viewer(models, :yz; kwargs...)
+function xz_slice_viewer(
+    M;
+    export_dir::String = "",
+    model_name::String = "model",
+    log10scale::Bool = false,
+    cmap = COLORMAP,
+    figsize = (1100, 950),
+    withPadding::Bool = false,
+    max_depth::Union{Nothing, Real} = nothing,
+    pad_tol::Real = 0.2,
+    value_range::Union{Nothing, Tuple{<:Real,<:Real}} = nothing,
+    show_grid::Bool = false,
+    grid_color = :black,
+    grid_linewidth::Real = 0.5,
+    grid_alpha::Real = 0.3,
+    horiz_label::String = "X (m)",
+    slider_label::String = "Y",
+    slider_unit::String = "m",
+    export_dpi::Int = 3,
+    export_figsize = (1100, 900)
+)
+    x_all = M.cx
+    y_all = M.cy
+    z_all, ze_all, z_top = _depths(M)                  # depth below the top of the topography, positive down
+    A_all = log10scale ? log10.(M.A) : copy(M.A)
 
-yz_slice_viewer(M::GravModel3D; model_name::AbstractString = "model", kwargs...) =
-    _section_viewer([String(model_name) => M], :yz; model_name, kwargs...)
+    ix_full = 1:length(x_all)
+    iy_full = 1:length(y_all)
+    ix_core = core_indices(x_all; tol = pad_tol)
+    iy_core = core_indices(y_all; tol = pad_tol)
 
-#---------- three planes together ----------
+    kz = _depth_layers(ze_all, max_depth)
+    z = z_all[kz]
 
-"""
-    draw_north_and_scale!(scene; xv, yv, z_fixed, show_north=true, show_scale=true, color=:black,
-                          line_width=2.0)
+    x_full = x_all[ix_full]
+    y_full = y_all[iy_full]
+    x_core = x_all[ix_core]
+    y_core = y_all[iy_core]
 
-A north arrow and a scale bar on a 3D scene, drawn on the plane `z_fixed`.
-"""
-function draw_north_and_scale!(scene; xv, yv, z_fixed::Real, show_north::Bool = true, show_scale::Bool = true,
-                               color = :black, line_width::Real = 2.0)
-    (isempty(xv) || isempty(yv)) && return nothing
+    R_full = A_all[ix_full, iy_full, kz]
+    R_core = A_all[ix_core, iy_core, kz]
+
+    x_edges_full = edges_from_centers(x_full)
+    x_edges_core = edges_from_centers(x_core)
+    z_edges = ze_all[first(kz):last(kz)+1]
+
+    # Negate z for plotting so depth increases downward (origin top-left)
+
+    cmin, cmax = compute_colorrange(R_full; value_range)
+
+    show_full_model = Observable(withPadding)
+
+    current_x_edges = Observable(withPadding ? x_edges_full : x_edges_core)
+
+    current_R = withPadding ? R_full : R_core
+    current_y = withPadding ? y_full : y_core
+
+    fig = Figure(size = figsize)
+
+    n_y = length(current_y)
+    first_y_str = _format_slider_val(current_y[1], slider_unit)
+    title_str = Observable("XZ Slice 1 / $(n_y) | $(slider_label) = $(first_y_str)")
+    Label(fig[0, 1:2], title_str, fontsize = 18, font = :bold)
+
+    # Tick formatter: plain depth values
+    depth_formatter(values) = [string(round(abs(v), sigdigits=4)) for v in values]
+
+    ax = Axis(fig[1, 1],
+        xlabel = horiz_label,
+        ylabel = "Depth (m)", yreversed = true,
+        title = "",
+        ytickformat = depth_formatter
+    )
+
+    current_slice_idx = Observable(1)
+    slice_data = Observable(current_R[:, 1, :])
+
+    current_colormap = Observable(cmap)
+
+    hm = heatmap!(ax, current_x_edges[], z_edges, slice_data,
+                  colormap = current_colormap,
+                  colorrange = (cmin, cmax))
+
+    grid_plots = Ref{Vector{Any}}([])
+
+    function draw_grid!(ax, x_edges)
+        for p in grid_plots[]
+            delete!(ax, p)
+        end
+        grid_plots[] = []
+
+        if show_grid
+            for ze in z_edges
+                p = lines!(ax, [x_edges[1], x_edges[end]], [ze, ze],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+                push!(grid_plots[], p)
+            end
+            for xe in x_edges
+                p = lines!(ax, [xe, xe], [z_edges[1], z_edges[end]],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+                push!(grid_plots[], p)
+            end
+        end
+    end
+
+    draw_grid!(ax, current_x_edges[])
+
+    # Constrain initial view to the model extent
+    xe_init = current_x_edges[]
+    limits!(ax, xe_init[1], xe_init[end], z_edges[end], z_edges[1])   # bottom first: Makie keeps the axis reversed
+
+    cb_label = _value_label(log10scale)
+    Colorbar(fig[1, 2], hm, label = cb_label)
+
+    slider_grid = fig[2, 1:2] = GridLayout()
+
+    btn_prev = Button(slider_grid[1, 1], label = "<< Prev")
+    Label(slider_grid[1, 2], "$(slider_label) Slice:", fontsize = 14)
+    sl = Slider(slider_grid[1, 3], range = 1:n_y, startvalue = 1, width = 400)
+    layer_label = Observable("1 / $(n_y)")
+    Label(slider_grid[1, 4], layer_label, fontsize = 14)
+    btn_next = Button(slider_grid[1, 5], label = "Next >>")
+
+    button_grid = fig[3, 1:2] = GridLayout()
+
+    btn_first = Button(button_grid[1, 1], label = "|<< First")
+    btn_last = Button(button_grid[1, 2], label = "Last >>|")
+
+    btn_label = Observable(withPadding ? "Show Core Model" : "Show Full Model")
+    btn_toggle = Button(button_grid[1, 3], label = btn_label)
+
+    btn_reset = Button(button_grid[1, 4], label = "Reset Zoom")
+
+    btn_export = Button(button_grid[1, 5], label = "Export Figure")
+
+    info_grid = fig[4, 1:2] = GridLayout()
+    depth_info = Observable("$(slider_label) position: $(first_y_str)")
+    Label(info_grid[1, 1], depth_info, fontsize = 12)
+
+    view_info = Observable(withPadding ? "View: Full Model (with padding)" : "View: Core Model (no padding)")
+    Label(info_grid[1, 2], view_info, fontsize = 12, color = :blue)
+
+    current_R_ref = Ref(current_R)
+    current_y_ref = Ref(current_y)
+    n_y_ref = Ref(n_y)
+
+    function reset_zoom!()
+        xe = current_x_edges[]
+        limits!(ax, xe[1], xe[end], z_edges[end], z_edges[1])   # bottom first: Makie keeps the axis reversed
+    end
+
+    function update_view!(show_full::Bool)
+        if show_full
+            current_x_edges[] = x_edges_full
+            current_R_ref[] = R_full
+            current_y_ref[] = y_full
+            n_y_ref[] = length(y_full)
+            btn_label[] = "Show Core Model"
+            view_info[] = "View: Full Model (with padding)"
+        else
+            current_x_edges[] = x_edges_core
+            current_R_ref[] = R_core
+            current_y_ref[] = y_core
+            n_y_ref[] = length(y_core)
+            btn_label[] = "Show Full Model"
+            view_info[] = "View: Core Model (no padding)"
+        end
+
+        set_close_to!(sl, clamp(current_slice_idx[], 1, n_y_ref[]))
+
+        slice_idx = clamp(current_slice_idx[], 1, n_y_ref[])
+        current_slice_idx[] = slice_idx
+        slice_data[] = current_R_ref[][:, slice_idx, :]
+
+        empty!(ax)
+        hm = heatmap!(ax, current_x_edges[], z_edges, slice_data,
+                      colormap = current_colormap,
+                      colorrange = (cmin, cmax))
+
+        draw_grid!(ax, current_x_edges[])
+
+        reset_zoom!()
+    end
+
+    function update_slice(slice_idx)
+        n = n_y_ref[]
+        slice_idx = clamp(slice_idx, 1, n)
+        current_slice_idx[] = slice_idx
+        slice_data[] = current_R_ref[][:, slice_idx, :]
+
+        layer_label[] = "$slice_idx / $(n)"
+
+        y_pos = current_y_ref[][slice_idx]
+        y_str = _format_slider_val(y_pos, slider_unit)
+
+        title_str[] = "XZ Slice $slice_idx / $(n) | $(slider_label) = $(y_str)"
+        depth_info[] = "$(slider_label) position: $(y_str)"
+    end
+
+    on(sl.value) do val
+        update_slice(val)
+    end
+
+    on(btn_prev.clicks) do _
+        set_close_to!(sl, max(1, sl.value[] - 1))
+    end
+
+    on(btn_next.clicks) do _
+        set_close_to!(sl, min(n_y_ref[], sl.value[] + 1))
+    end
+
+    on(btn_first.clicks) do _
+        set_close_to!(sl, 1)
+    end
+
+    on(btn_last.clicks) do _
+        set_close_to!(sl, n_y_ref[])
+    end
+
+    on(btn_toggle.clicks) do _
+        show_full_model[] = !show_full_model[]
+        update_view!(show_full_model[])
+    end
+
+    on(btn_reset.clicks) do _
+        reset_zoom!()
+    end
+
+    function export_figure()
+        slice_idx = current_slice_idx[]
+        y_pos = current_y_ref[][slice_idx]
+        y_str = _format_slider_val(y_pos, slider_unit)
+
+        xe = current_x_edges[]
+        data = slice_data[]
+        cmap_val = current_colormap[]
+
+        export_fig = Figure(size = export_figsize, fontsize = 16)
+
+        Label(export_fig[1, 1:2], "XZ Slice $slice_idx | $(slider_label) = $(y_str)",
+              fontsize = 20, font = :bold)
+
+        export_ax = Axis(export_fig[2, 1],
+            xlabel = horiz_label,
+            ylabel = "Depth (m)", yreversed = true,
+            xlabelsize = 16,
+            ylabelsize = 16,
+            xticklabelsize = 12,
+            yticklabelsize = 12,
+            ytickformat = depth_formatter
+        )
+
+        export_hm = heatmap!(export_ax, xe, z_edges, data,
+                            colormap = cmap_val,
+                            colorrange = (cmin, cmax))
+
+        if show_grid
+            for ze in z_edges
+                lines!(export_ax, [xe[1], xe[end]], [ze, ze],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+            end
+            for x_edge in xe
+                lines!(export_ax, [x_edge, x_edge], [z_edges[1], z_edges[end]],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+            end
+        end
+
+        # Clip export to current model extent
+        limits!(export_ax, xe[1], xe[end], z_edges[end], z_edges[1])   # bottom first: Makie keeps the axis reversed
+
+        cb_lbl = _value_label(log10scale)
+        Colorbar(export_fig[2, 2], export_hm, label = cb_lbl, labelsize = 16, ticklabelsize = 12)
+
+        colsize!(export_fig.layout, 2, Relative(0.05))
+
+        view_type = show_full_model[] ? "full" : "core"
+        timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
+        filename = "$(model_name)_XZ_slice$(slice_idx)_$(view_type)_$(timestamp).png"
+        filename = joinpath(isempty(export_dir) ? pwd() : export_dir, filename)
+
+        save(filename, export_fig, px_per_unit = export_dpi)
+
+        w_px = round(Int, export_figsize[1] * export_dpi)
+        h_px = round(Int, export_figsize[2] * export_dpi)
+
+        println("Figure exported: $filename")
+        println("  Resolution: $(w_px) × $(h_px) pixels")
+        println("  XZ Slice: $slice_idx, $(slider_label) = $(y_str)")
+
+        return filename
+    end
+
+    on(btn_export.clicks) do _
+        export_figure()
+    end
+
+    return fig, (
+        ax = ax,
+        heatmap = hm,
+        slider = sl,
+        current_slice_idx = current_slice_idx,
+        slice_data = slice_data,
+        show_full_model = show_full_model,
+        R_full = R_full,
+        R_core = R_core,
+        x_full = x_full, y_full = y_full,
+        x_core = x_core, y_core = y_core,
+        z = z,
+        x_edges_full = x_edges_full,
+        x_edges_core = x_edges_core,
+        z_edges = z_edges,
+        colorrange = (cmin = cmin, cmax = cmax),
+        reset_zoom! = reset_zoom!
+    )
+end
+
+# ---------- Main viewer function ----------
+
+function yz_slice_viewer(
+    M;
+    export_dir::String = "",
+    model_name::String = "model",
+    log10scale::Bool = false,
+    cmap = COLORMAP,
+    figsize = (1100, 950),
+    withPadding::Bool = false,
+    max_depth::Union{Nothing, Real} = nothing,
+    pad_tol::Real = 0.2,
+    value_range::Union{Nothing, Tuple{<:Real,<:Real}} = nothing,
+    show_grid::Bool = false,
+    grid_color = :black,
+    grid_linewidth::Real = 0.5,
+    grid_alpha::Real = 0.3,
+    horiz_label::String = "Y (m)",
+    slider_label::String = "X",
+    slider_unit::String = "m",
+    export_dpi::Int = 3,
+    export_figsize = (1100, 900)
+)
+    x_all = M.cx
+    y_all = M.cy
+    z_all, ze_all, z_top = _depths(M)                  # depth below the top of the topography, positive down
+    A_all = log10scale ? log10.(M.A) : copy(M.A)
+
+    ix_full = 1:length(x_all)
+    iy_full = 1:length(y_all)
+    ix_core = core_indices(x_all; tol = pad_tol)
+    iy_core = core_indices(y_all; tol = pad_tol)
+
+    kz = _depth_layers(ze_all, max_depth)
+    z = z_all[kz]
+
+    x_full = x_all[ix_full]
+    y_full = y_all[iy_full]
+    x_core = x_all[ix_core]
+    y_core = y_all[iy_core]
+
+    R_full = A_all[ix_full, iy_full, kz]
+    R_core = A_all[ix_core, iy_core, kz]
+
+    y_edges_full = edges_from_centers(y_full)
+    y_edges_core = edges_from_centers(y_core)
+    z_edges = ze_all[first(kz):last(kz)+1]
+
+    # Negate z for plotting so depth increases downward (origin top-left)
+
+    cmin, cmax = compute_colorrange(R_full; value_range)
+
+    show_full_model = Observable(withPadding)
+
+    current_y_edges = Observable(withPadding ? y_edges_full : y_edges_core)
+
+    current_R = withPadding ? R_full : R_core
+    current_x = withPadding ? x_full : x_core
+
+    fig = Figure(size = figsize)
+
+    n_x = length(current_x)
+    first_x_str = _format_slider_val(current_x[1], slider_unit)
+    title_str = Observable("YZ Slice 1 / $(n_x) | $(slider_label) = $(first_x_str)")
+    Label(fig[0, 1:2], title_str, fontsize = 18, font = :bold)
+
+    # Tick formatter: plain depth values
+    depth_formatter(values) = [string(round(abs(v), sigdigits=4)) for v in values]
+
+    ax = Axis(fig[1, 1],
+        xlabel = horiz_label,
+        ylabel = "Depth (m)", yreversed = true,
+        title = "",
+        ytickformat = depth_formatter
+    )
+
+    current_slice_idx = Observable(1)
+    slice_data = Observable(current_R[1, :, :])
+
+    current_colormap = Observable(cmap)
+
+    hm = heatmap!(ax, current_y_edges[], z_edges, slice_data,
+                  colormap = current_colormap,
+                  colorrange = (cmin, cmax))
+
+    grid_plots = Ref{Vector{Any}}([])
+
+    function draw_grid!(ax, y_edges)
+        for p in grid_plots[]
+            delete!(ax, p)
+        end
+        grid_plots[] = []
+
+        if show_grid
+            for ze in z_edges
+                p = lines!(ax, [y_edges[1], y_edges[end]], [ze, ze],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+                push!(grid_plots[], p)
+            end
+            for ye in y_edges
+                p = lines!(ax, [ye, ye], [z_edges[1], z_edges[end]],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+                push!(grid_plots[], p)
+            end
+        end
+    end
+
+    draw_grid!(ax, current_y_edges[])
+
+    # Constrain initial view to the model extent
+    ye_init = current_y_edges[]
+    limits!(ax, ye_init[1], ye_init[end], z_edges[end], z_edges[1])   # bottom first: Makie keeps the axis reversed
+
+    cb_label = _value_label(log10scale)
+    Colorbar(fig[1, 2], hm, label = cb_label)
+
+    slider_grid = fig[2, 1:2] = GridLayout()
+
+    btn_prev = Button(slider_grid[1, 1], label = "<< Prev")
+    Label(slider_grid[1, 2], "$(slider_label) Slice:", fontsize = 14)
+    sl = Slider(slider_grid[1, 3], range = 1:n_x, startvalue = 1, width = 400)
+    layer_label = Observable("1 / $(n_x)")
+    Label(slider_grid[1, 4], layer_label, fontsize = 14)
+    btn_next = Button(slider_grid[1, 5], label = "Next >>")
+
+    button_grid = fig[3, 1:2] = GridLayout()
+
+    btn_first = Button(button_grid[1, 1], label = "|<< First")
+    btn_last = Button(button_grid[1, 2], label = "Last >>|")
+
+    btn_label = Observable(withPadding ? "Show Core Model" : "Show Full Model")
+    btn_toggle = Button(button_grid[1, 3], label = btn_label)
+
+    btn_reset = Button(button_grid[1, 4], label = "Reset Zoom")
+
+    btn_export = Button(button_grid[1, 5], label = "Export Figure")
+
+    info_grid = fig[4, 1:2] = GridLayout()
+    depth_info = Observable("$(slider_label) position: $(first_x_str)")
+    Label(info_grid[1, 1], depth_info, fontsize = 12)
+
+    view_info = Observable(withPadding ? "View: Full Model (with padding)" : "View: Core Model (no padding)")
+    Label(info_grid[1, 2], view_info, fontsize = 12, color = :blue)
+
+    current_R_ref = Ref(current_R)
+    current_x_ref = Ref(current_x)
+    n_x_ref = Ref(n_x)
+
+    function reset_zoom!()
+        ye = current_y_edges[]
+        limits!(ax, ye[1], ye[end], z_edges[end], z_edges[1])   # bottom first: Makie keeps the axis reversed
+    end
+
+    function update_view!(show_full::Bool)
+        if show_full
+            current_y_edges[] = y_edges_full
+            current_R_ref[] = R_full
+            current_x_ref[] = x_full
+            n_x_ref[] = length(x_full)
+            btn_label[] = "Show Core Model"
+            view_info[] = "View: Full Model (with padding)"
+        else
+            current_y_edges[] = y_edges_core
+            current_R_ref[] = R_core
+            current_x_ref[] = x_core
+            n_x_ref[] = length(x_core)
+            btn_label[] = "Show Full Model"
+            view_info[] = "View: Core Model (no padding)"
+        end
+
+        set_close_to!(sl, clamp(current_slice_idx[], 1, n_x_ref[]))
+
+        slice_idx = clamp(current_slice_idx[], 1, n_x_ref[])
+        current_slice_idx[] = slice_idx
+        slice_data[] = current_R_ref[][slice_idx, :, :]
+
+        empty!(ax)
+        hm = heatmap!(ax, current_y_edges[], z_edges, slice_data,
+                      colormap = current_colormap,
+                      colorrange = (cmin, cmax))
+
+        draw_grid!(ax, current_y_edges[])
+
+        reset_zoom!()
+    end
+
+    function update_slice(slice_idx)
+        n = n_x_ref[]
+        slice_idx = clamp(slice_idx, 1, n)
+        current_slice_idx[] = slice_idx
+        slice_data[] = current_R_ref[][slice_idx, :, :]
+
+        layer_label[] = "$slice_idx / $(n)"
+
+        x_pos = current_x_ref[][slice_idx]
+        x_str = _format_slider_val(x_pos, slider_unit)
+
+        title_str[] = "YZ Slice $slice_idx / $(n) | $(slider_label) = $(x_str)"
+        depth_info[] = "$(slider_label) position: $(x_str)"
+    end
+
+    on(sl.value) do val
+        update_slice(val)
+    end
+
+    on(btn_prev.clicks) do _
+        set_close_to!(sl, max(1, sl.value[] - 1))
+    end
+
+    on(btn_next.clicks) do _
+        set_close_to!(sl, min(n_x_ref[], sl.value[] + 1))
+    end
+
+    on(btn_first.clicks) do _
+        set_close_to!(sl, 1)
+    end
+
+    on(btn_last.clicks) do _
+        set_close_to!(sl, n_x_ref[])
+    end
+
+    on(btn_toggle.clicks) do _
+        show_full_model[] = !show_full_model[]
+        update_view!(show_full_model[])
+    end
+
+    on(btn_reset.clicks) do _
+        reset_zoom!()
+    end
+
+    function export_figure()
+        slice_idx = current_slice_idx[]
+        x_pos = current_x_ref[][slice_idx]
+        x_str = _format_slider_val(x_pos, slider_unit)
+
+        ye = current_y_edges[]
+        data = slice_data[]
+        cmap_val = current_colormap[]
+
+        export_fig = Figure(size = export_figsize, fontsize = 16)
+
+        Label(export_fig[1, 1:2], "YZ Slice $slice_idx | $(slider_label) = $(x_str)",
+              fontsize = 20, font = :bold)
+
+        export_ax = Axis(export_fig[2, 1],
+            xlabel = horiz_label,
+            ylabel = "Depth (m)", yreversed = true,
+            xlabelsize = 16,
+            ylabelsize = 16,
+            xticklabelsize = 12,
+            yticklabelsize = 12,
+            ytickformat = depth_formatter
+        )
+
+        export_hm = heatmap!(export_ax, ye, z_edges, data,
+                            colormap = cmap_val,
+                            colorrange = (cmin, cmax))
+
+        if show_grid
+            for ze in z_edges
+                lines!(export_ax, [ye[1], ye[end]], [ze, ze],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+            end
+            for y_edge in ye
+                lines!(export_ax, [y_edge, y_edge], [z_edges[1], z_edges[end]],
+                       color = (grid_color, grid_alpha),
+                       linewidth = grid_linewidth)
+            end
+        end
+
+        # Clip export to current model extent
+        limits!(export_ax, ye[1], ye[end], z_edges[end], z_edges[1])   # bottom first: Makie keeps the axis reversed
+
+        cb_lbl = _value_label(log10scale)
+        Colorbar(export_fig[2, 2], export_hm, label = cb_lbl, labelsize = 16, ticklabelsize = 12)
+
+        colsize!(export_fig.layout, 2, Relative(0.05))
+
+        view_type = show_full_model[] ? "full" : "core"
+        timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
+        filename = "$(model_name)_YZ_slice$(slice_idx)_$(view_type)_$(timestamp).png"
+        filename = joinpath(isempty(export_dir) ? pwd() : export_dir, filename)
+
+        save(filename, export_fig, px_per_unit = export_dpi)
+
+        w_px = round(Int, export_figsize[1] * export_dpi)
+        h_px = round(Int, export_figsize[2] * export_dpi)
+
+        println("Figure exported: $filename")
+        println("  Resolution: $(w_px) × $(h_px) pixels")
+        println("  YZ Slice: $slice_idx, $(slider_label) = $(x_str)")
+
+        return filename
+    end
+
+    on(btn_export.clicks) do _
+        export_figure()
+    end
+
+    return fig, (
+        ax = ax,
+        heatmap = hm,
+        slider = sl,
+        current_slice_idx = current_slice_idx,
+        slice_data = slice_data,
+        show_full_model = show_full_model,
+        R_full = R_full,
+        R_core = R_core,
+        x_full = x_full, y_full = y_full,
+        x_core = x_core, y_core = y_core,
+        z = z,
+        y_edges_full = y_edges_full,
+        y_edges_core = y_edges_core,
+        z_edges = z_edges,
+        colorrange = (cmin = cmin, cmax = cmax),
+        reset_zoom! = reset_zoom!
+    )
+end
+
+function draw_north_and_scale!(ax;
+    xv,
+    yv,
+    z_fixed::Real,
+    target_crs::AbstractString,
+    north_axis::Symbol = :y,
+    show_north::Bool = true,
+    show_scale::Bool = true,
+    color = :black,
+    line_width::Real = 2.0)
+
+    isempty(xv) && return
+    isempty(yv) && return
+
     xmin, xmax = extrema(xv)
     ymin, ymax = extrema(yv)
-    dx, dy = xmax - xmin, ymax - ymin
-    (dx > 0 && dy > 0) || return nothing
+    dx = xmax - xmin
+    dy = ymax - ymin
+    (dx <= 0 || dy <= 0) && return
+
     z = Float64(z_fixed)
-    if show_north                                          # x is north, so the arrow points along +x
-        x0, y0 = xmin + 0.78 * dx, ymin + 0.10 * dy
-        len    = 0.09 * min(dx, dy)
-        head   = 0.3 * len
-        lines!(scene, [x0, x0 + len], [y0, y0], [z, z]; color, linewidth = line_width, overdraw = true)
-        lines!(scene, [x0 + len - head, x0 + len], [y0 - head, y0], [z, z]; color, linewidth = line_width,
-               overdraw = true)
-        lines!(scene, [x0 + len - head, x0 + len], [y0 + head, y0], [z, z]; color, linewidth = line_width,
-               overdraw = true)
-        text!(scene, [x0 + len + 0.03 * dx], [y0], [z]; text = ["N"], color, fontsize = 16, overdraw = true)
+    x_north = xmin + 0.86 * dx
+    y_north = ymin + 0.10 * dy
+    x_scale = xmin + 0.68 * dx
+    y_scale = ymin + 0.10 * dy
+
+    if show_north
+        arrow_len = 0.06 * min(dx, dy)
+        if north_axis == :x
+            x1 = x_north + arrow_len
+            y1 = y_north
+            ah = 0.025 * min(dx, dy)
+            lines!(ax, [x_north, x1], [y_north, y1], [z, z], color = color, linewidth = line_width, overdraw = true)
+            lines!(ax, [x1 - ah, x1], [y1 - ah, y1], [z, z], color = color, linewidth = line_width, overdraw = true)
+            lines!(ax, [x1 - ah, x1], [y1 + ah, y1], [z, z], color = color, linewidth = line_width, overdraw = true)
+            text!(ax, [x1 + 0.02 * dx], [y1], [z], text = ["N"], color = color, fontsize = 16, overdraw = true)
+        else
+            x1 = x_north
+            y1 = y_north + arrow_len
+            ah = 0.025 * min(dx, dy)
+            lines!(ax, [x_north, x1], [y_north, y1], [z, z], color = color, linewidth = line_width, overdraw = true)
+            lines!(ax, [x1 - ah, x1], [y1 - ah, y1], [z, z], color = color, linewidth = line_width, overdraw = true)
+            lines!(ax, [x1 + ah, x1], [y1 - ah, y1], [z, z], color = color, linewidth = line_width, overdraw = true)
+            text!(ax, [x1], [y1 + 0.02 * dy], [z], text = ["N"], color = color, fontsize = 16, overdraw = true)
+        end
     end
+
     if show_scale
-        len  = _nice_scale_length(0.25 * dy)
-        x0   = xmin + 0.08 * dx
-        y0   = ymin + 0.10 * dy
-        tick = 0.012 * dx
-        lines!(scene, [x0, x0], [y0, y0 + len], [z, z]; color, linewidth = line_width, overdraw = true)
-        lines!(scene, [x0 - tick, x0 + tick], [y0, y0], [z, z]; color, linewidth = line_width, overdraw = true)
-        lines!(scene, [x0 - tick, x0 + tick], [y0 + len, y0 + len], [z, z]; color, linewidth = line_width,
-               overdraw = true)
-        text!(scene, [x0 + 0.02 * dx], [y0 + len / 2], [z]; text = [_format_length(len)], color, fontsize = 12,
-              overdraw = true)
+        target_len = 0.10 * dx
+        scale_len = _nice_scale_length(target_len)
+        xb0 = x_scale
+        xb1 = xb0 + scale_len
+        yb = y_scale
+
+        lines!(ax, [xb0, xb1], [yb, yb], [z, z], color = color, linewidth = line_width, overdraw = true)
+
+        tick = 0.008 * dy
+        lines!(ax, [xb0, xb0], [yb - tick, yb + tick], [z, z], color = color, linewidth = line_width, overdraw = true)
+        lines!(ax, [xb1, xb1], [yb - tick, yb + tick], [z, z], color = color, linewidth = line_width, overdraw = true)
+
+        unit_label = uppercase(strip(target_crs)) == "EPSG:4326" ? "deg" : "m"
+        label_val = unit_label == "m" && scale_len >= 1000 ? "$(round(scale_len / 1000; digits = 2)) km" : "$(round(scale_len; sigdigits = 3)) $unit_label"
+        text!(ax, [0.5 * (xb0 + xb1)], [yb + 0.02 * dy], [z], text = [label_val], color = color, fontsize = 12, overdraw = true)
     end
-    nothing
 end
 
-"""
-    grav_3d_viewer(models; model_name="model", cmap=Reverse(:Spectral), figsize=nothing,
-                   with_padding=false, max_depth=nothing, pad_tol=0.2, density_range=nothing,
-                   station_x=Float64[], station_y=Float64[], station_z=Float64[],
-                   show_north_arrow=true, show_scale_bar=true, export_dpi=3, output_dir=pwd()) -> (fig, parts)
-
-The three orthogonal planes of one or several density models, a 3D scene each, on shared sliders and visibility toggles.
-"""
-function grav_3d_viewer(models::AbstractVector{<:Pair{String, GravModel3D}};
-                        model_name::AbstractString = "model",
-                        cmap = _GRAV_COLORMAP,
-                        figsize = nothing,
-                        with_padding::Bool = false,
-                        max_depth = nothing,
-                        pad_tol::Real = 0.2,
-                        density_range = nothing,
-                        station_x::AbstractVector = Float64[],
-                        station_y::AbstractVector = Float64[],
-                        station_z::AbstractVector = Float64[],
-                        show_north_arrow::Bool = true,
-                        show_scale_bar::Bool = true,
-                        annotation_color = :black,
-                        annotation_line_width::Real = 2.0,
-                        default_view_direction = Vec3f(-1.05f0, -0.80f0, 0.72f0),
-                        default_view_scale = 1.12f0,
-                        export_dpi::Int = 3,
-                        output_dir::AbstractString = pwd())
-    panels = _viewer_panels(models; max_depth, pad_tol)
-    ncol   = length(panels)
-    cmin, cmax = _panel_colorrange(panels, density_range)
-
-    show_full = Observable(with_padding)
-    state     = [(; p...,
-                    x      = Ref(with_padding ? p.a.x_full : p.a.x_core),
-                    y      = Ref(with_padding ? p.a.y_full : p.a.y_core),
-                    z      = Ref(-p.a.z),
-                    R      = Ref(with_padding ? p.a.R_full : p.a.R_core),
-                    scene  = Ref{Any}(nothing),
-                    plt    = Ref{Any}(nothing),
-                    planes = Ref{NamedTuple}((yz = nothing, xz = nothing, xy = nothing))) for p in panels]
-    head = first(state)
-
-    fig = Figure(size = figsize === nothing ? (940 * ncol + 100, 920) : figsize, fontsize = 14)
-    for (c, s) in enumerate(state)
-        ncol > 1 && Label(fig[0, c], s.label; fontsize = 18, font = :bold)
-        s.scene[] = LScene(fig[1, c], show_axis = false)
+function plot_shapefile_on_3d!(ax, shapefile_path;
+    z_fixed::Real = 0.0,
+    point_color = :black,
+    line_color = :black,
+    point_size = 7,
+    line_width = 1.5,
+    auto_reproject_to_wgs84 = true,
+    post_transform = (x, y) -> (x, y),
+    xlim::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    ylim::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    z_at = nothing)
+    # z_at(x, y) drapes the overlay on a surface (topography); otherwise everything sits at z_fixed
+    zs(xv, yv) = isnothing(z_at) ? fill(Float64(z_fixed), length(xv)) : Float64[z_at(x, y) for (x, y) in zip(xv, yv)]
+    if isnothing(shapefile_path) || !isfile(shapefile_path)
+        isnothing(shapefile_path) || @warn "Shapefile not found: $shapefile_path"
+        return 0
     end
-    controls = fig[2, 1:ncol+1] = GridLayout()
-    info     = Observable(" ")
-    Label(fig[3, 1:ncol+1], info, fontsize = 11, color = :gray35, halign = :left, tellwidth = false)
-    rowsize!(fig.layout, 1, Relative(0.84))
-    Colorbar(fig[1, ncol+1]; colormap = cmap, colorrange = (cmin, cmax), label = _GRAV_DENSITY_LABEL, width = 16)
-
-    # plots are drawn in order of their z translation, so the annotations are built low and lifted back up,
-    # which puts them in place but drawn after the slice planes
-    lift_by   = 2 * maximum(abs, head.a.z_edges) + 1.0
-    overlays! = function (s)
-        scene = s.scene[].scene
-        n0    = length(scene.plots)
-        draw_north_and_scale!(scene; xv = s.x[], yv = s.y[], z_fixed = -first(s.a.z_edges) - lift_by,
-                              show_north = show_north_arrow, show_scale = show_scale_bar,
-                              color = annotation_color, line_width = annotation_line_width)
-        if !isempty(station_x)
-            zs = length(station_z) == length(station_x) ? collect(float.(station_z)) :
-                                                          fill(-first(s.a.z_edges), length(station_x))
-            scatter!(scene, station_x, station_y, zs .- lift_by; color = annotation_color,
-                     markersize = 7, overdraw = true)
-        end
-        for p in scene.plots[n0+1:end]
-            translate!(p, 0, 0, lift_by)
-        end
+    table = Shapefile.Table(shapefile_path)
+    rows = collect(table)
+    crs_type, _ = detect_shapefile_crs(shapefile_path)
+    coord_transform, _, _ = _make_coord_transform(shapefile_path, crs_type; auto_reproject_to_wgs84 = auto_reproject_to_wgs84)
+    function _is_xy(c)
+        return (c isa Tuple || c isa AbstractVector) && length(c) >= 2 && c[1] isa Real && c[2] isa Real
     end
 
-    build! = function ()
-        for s in state
-            scene = s.scene[].scene
-            for p in copy(scene.plots)
-                delete!(scene, p)
+    xlo, xhi = isnothing(xlim) ? (-Inf, Inf) : (min(Float64(xlim[1]), Float64(xlim[2])), max(Float64(xlim[1]), Float64(xlim[2])))
+    ylo, yhi = isnothing(ylim) ? (-Inf, Inf) : (min(Float64(ylim[1]), Float64(ylim[2])), max(Float64(ylim[1]), Float64(ylim[2])))
+    inside = (x, y) -> (x >= xlo && x <= xhi && y >= ylo && y <= yhi)
+
+    function plot_coords_recursive!(coords)
+        if _is_xy(coords)
+            x, y = post_transform(coord_transform(Float64(coords[1]), Float64(coords[2]))...)
+            inside(x, y) || return 0
+            scatter!(ax, [x], [y], zs([x], [y]), color = point_color, markersize = point_size, overdraw = true)
+            return 1
+        elseif coords isa AbstractVector
+            isempty(coords) && return 0
+            first_item = first(coords)
+            if _is_xy(first_item)
+                xy = Tuple{Float64, Float64}[]
+                for p in coords
+                    if _is_xy(p)
+                        x0, y0 = coord_transform(Float64(p[1]), Float64(p[2]))
+                        x, y = post_transform(x0, y0)
+                        push!(xy, (x, y))
+                    end
+                end
+
+                segments_plotted = 0
+                run_x = Float64[]
+                run_y = Float64[]
+                for (x, y) in xy
+                    if inside(x, y)
+                        push!(run_x, x)
+                        push!(run_y, y)
+                    else
+                        if length(run_x) >= 2
+                            lines!(ax, run_x, run_y, zs(run_x, run_y), color = line_color, linewidth = line_width, overdraw = true)
+                            segments_plotted += 1
+                        end
+                        empty!(run_x)
+                        empty!(run_y)
+                    end
+                end
+
+                if length(run_x) >= 2
+                    lines!(ax, run_x, run_y, zs(run_x, run_y), color = line_color, linewidth = line_width, overdraw = true)
+                    segments_plotted += 1
+                end
+
+                return segments_plotted
+            else
+                count = 0
+                for part in coords
+                    count += plot_coords_recursive!(part)
+                end
+                return count
             end
-            s.plt[]    = volumeslices!(s.scene[], s.x[], s.y[], s.z[], s.R[]; colormap = cmap,
-                                       colorrange = (cmin, cmax), nan_color = :transparent, bbox_visible = true)
-            s.planes[] = (yz = s.plt[][:heatmap_yz][], xz = s.plt[][:heatmap_xz][], xy = s.plt[][:heatmap_xy][])
-            overlays!(s)
+        end
+        return 0
+    end
+    total_points = 0
+    for row in rows
+        geom = GeoInterface.geometry(row)
+        coords = try
+            GeoInterface.coordinates(geom)
+        catch
+            nothing
+        end
+        if !isnothing(coords)
+            total_points += plot_coords_recursive!(coords)
         end
     end
+    return total_points
+end
 
-    build!()
-    for s in state
-        cam3d!(s.scene[].scene, projectiontype = Makie.Perspective)
+function model_3d_viewer(
+    M;
+    export_dir::String = "",
+    log10scale::Bool = false,
+    cmap = COLORMAP,
+    figsize = (1800, 920),
+    withPadding::Bool = true,
+    max_depth::Union{Nothing, Real} = nothing,
+    pad_tol::Real = 0.2,
+    value_range::Union{Nothing, Tuple{<:Real,<:Real}} = nothing,
+    target_crs::AbstractString,
+    overlay_transform = (x, y) -> (x, y),
+    north_axis::Symbol = :y,
+    site_e::Vector{Float64} = Float64[],
+    site_n::Vector{Float64} = Float64[],
+    site_z::Vector{Float64} = Float64[],
+    surface_elev::Union{Nothing, AbstractMatrix} = nothing,
+    shapefile_path = nothing,
+    overlay_z_fixed::Union{Nothing, Real} = nothing,
+    overlay_auto_reproject_to_wgs84::Bool = true,
+    overlay_point_color = :black,
+    overlay_line_color = :black,
+    overlay_point_size = 7,
+    overlay_line_width = 1.5,
+    show_north_arrow::Bool = true,
+    show_scale_bar::Bool = true,
+    annotation_color = :black,
+    annotation_line_width::Real = 2.0,
+    default_view_direction = Vec3f(-1.05f0, -0.80f0, 0.72f0),
+    default_view_scale = 1.12f0
+)
+
+    x_all = M.cx
+    y_all = M.cy
+    z_all, ze_all, z_top = _depths(M)                  # depth below the top of the topography, positive down
+    A_all = log10scale ? log10.(M.A) : M.A
+    axis_meta = _axis_metadata_for_crs(target_crs)
+
+    ix_full = 1:length(x_all)
+    iy_full = 1:length(y_all)
+    ix_core = core_indices(x_all; tol = pad_tol)
+    iy_core = core_indices(y_all; tol = pad_tol)
+
+    if withPadding
+        ix = ix_full
+        iy = iy_full
+    else
+        ix = ix_core
+        iy = iy_core 
     end
 
-    fit_camera! = function ()
-        for s in state
-            xmn, xmx = extrema(s.x[]); ymn, ymx = extrema(s.y[]); zmn, zmx = extrema(s.z[])
-            centre = Vec3f((xmn + xmx) / 2, (ymn + ymx) / 2, (zmn + zmx) / 2)
-            horiz  = Float32(max(xmx - xmn, ymx - ymn))
-            zspan  = max(Float32(zmx - zmn), 0.45f0 * horiz)
-            d      = default_view_direction ./ sqrt(sum(abs2, default_view_direction))
-            eye    = centre + Vec3f(default_view_scale * d[1] * horiz, default_view_scale * d[2] * horiz,
-                                    default_view_scale * d[3] * zspan)
-            update_cam!(s.scene[].scene, eye, centre, Vec3f(0, 0, 1))
+    x = x_all[ix]
+    y = y_all[iy]
+
+    kz = _depth_layers(ze_all, max_depth)
+
+    z = -z_all[kz]
+    R = A_all[ix, iy, kz]
+
+    # Overlay elevations (z up). overlay_z_fixed puts every overlay on one plane; otherwise
+    # sites keep their own elevation, shapefiles drape on the earth surface (surface_elev on
+    # the x_all × y_all cell centres; flat models give 0) and annotations sit on its highest point.
+    # the scene is z up with 0 at the top of the topography: an elevation e (m a.s.l.) sits at e + z_top − datum
+    z_elev = z_top - M.datum
+    model_top = isnothing(surface_elev) ? -ze_all[first(kz)] : Float64(maximum(surface_elev)) + z_elev
+    annot_z = isnothing(overlay_z_fixed) ? model_top : Float64(overlay_z_fixed) + z_elev
+    overlay_z_at = if isnothing(overlay_z_fixed) && !isnothing(surface_elev)
+        (xq, yq) -> Float64(surface_elev[argmin(abs.(x_all .- xq)), argmin(abs.(y_all .- yq))]) + z_elev
+    else
+        nothing
+    end
+    site_zv = if !isnothing(overlay_z_fixed) || length(site_z) != length(site_e)
+        fill(annot_z, length(site_e))
+    else
+        site_z .+ z_elev
+    end
+
+    # GLMakie draws plots in order of their z translation, so the XY slice (translated to its elevation) is drawn
+    # after overlays at translation 0 and covers them despite overdraw. Overlays are drawn `lift` lower and
+    # translated `lift` up: same place, drawn last.
+    lift = 2 * maximum(abs, z_all) + 1.0
+    function draw_overlays!(scene, xv, yv; annotations::Bool = true)
+        n0 = length(scene.plots)
+        if annotations
+            !isnothing(shapefile_path) && plot_shapefile_on_3d!(scene, shapefile_path;
+                z_fixed = annot_z - lift,
+                point_color = overlay_point_color,
+                line_color = overlay_line_color,
+                point_size = overlay_point_size,
+                line_width = overlay_line_width,
+                auto_reproject_to_wgs84 = overlay_auto_reproject_to_wgs84,
+                post_transform = overlay_transform,
+                xlim = extrema(xv),
+                ylim = extrema(yv),
+                z_at = isnothing(overlay_z_at) ? nothing : (xq, yq) -> overlay_z_at(xq, yq) - lift)
+            draw_north_and_scale!(scene;
+                xv = xv,
+                yv = yv,
+                z_fixed = annot_z - lift,
+                target_crs = target_crs,
+                north_axis = north_axis,
+                show_north = show_north_arrow,
+                show_scale = show_scale_bar,
+                color = annotation_color,
+                line_width = annotation_line_width)
         end
+        isempty(site_e) || scatter!(scene, site_e, site_n, site_zv .- lift;
+            color = overlay_point_color, marker = :circle, markersize = overlay_point_size, overdraw = true)
+        for p in scene.plots[n0+1:end]
+            translate!(p, 0, 0, lift)
+        end
+        return nothing
     end
-    fit_camera!()
 
-    nx()  = length(head.x[])
-    ny()  = length(head.y[])
-    ndep() = length(head.z[])
+    cmin, cmax = compute_colorrange(R; value_range)
 
-    Label(controls[1, 1], "North:", halign = :right)
-    btn_prev_yz = Button(controls[1, 2], label = "Prev")
-    sl_yz       = Slider(controls[1, 3], range = 1:nx(), startvalue = cld(nx(), 2), width = 180)
-    btn_next_yz = Button(controls[1, 4], label = "Next")
-    tog_yz      = Toggle(controls[1, 5], active = true)
-    lbl_yz      = Label(controls[1, 6], _format_position(head.x[][sl_yz.value[]]), color = :gray35)
+    current_colormap = Observable(cmap)
+    show_full_model = Observable(withPadding)
+    current_x = Observable(copy(x))
+    current_y = Observable(copy(y))
+    current_z = Observable(copy(z))
+    current_R = Observable(copy(R))
 
-    Label(controls[1, 7], "East:", halign = :right)
-    btn_prev_xz = Button(controls[1, 8], label = "Prev")
-    sl_xz       = Slider(controls[1, 9], range = 1:ny(), startvalue = cld(ny(), 2), width = 180)
-    btn_next_xz = Button(controls[1, 10], label = "Next")
-    tog_xz      = Toggle(controls[1, 11], active = true)
-    lbl_xz      = Label(controls[1, 12], _format_position(head.y[][sl_xz.value[]]), color = :gray35)
+    current_plt = Ref{Any}(nothing)
+    current_heatmaps = Ref{NamedTuple}((yz=nothing, xz=nothing, xy=nothing))
 
-    Label(controls[1, 13], "Depth:", halign = :right)
-    btn_prev_xy = Button(controls[1, 14], label = "Prev")
-    sl_xy       = Slider(controls[1, 15], range = 1:ndep(), startvalue = cld(ndep(), 2), width = 180)
-    btn_next_xy = Button(controls[1, 16], label = "Next")
-    tog_xy      = Toggle(controls[1, 17], active = true)
-    lbl_xy      = Label(controls[1, 18], _format_position(-head.z[][sl_xy.value[]]), color = :gray35)
+    fig = Figure(size = figsize)
 
-    btn_toggle = Button(controls[1, 19], label = with_padding ? "Show core" : "Show full")
-    btn_reset  = Button(controls[1, 20], label = "Reset view")
-    btn_export = Button(controls[1, 21], label = "Export")
+    ax = LScene(fig[1, 1], show_axis = false)
+    controls = fig[2, 1] = GridLayout()
+    axis_bar = fig[3, 1] = GridLayout()
+
+    cb_label = _value_label(log10scale)
+
+    rowsize!(fig.layout, 1, Relative(0.82))
+    rowsize!(fig.layout, 2, Auto(56))
+    rowsize!(fig.layout, 3, Auto(28))
+    colsize!(fig.layout, 1, Relative(0.96))
+
+    plt = volumeslices!(ax, current_x[], current_y[], current_z[], current_R[]; 
+                        colormap = current_colormap[], 
+                        colorrange = (cmin, cmax), 
+                        bbox_visible = true)
+    draw_overlays!(ax.scene, current_x[], current_y[])
+    current_plt[] = plt
+    current_heatmaps[] = (yz=plt[:heatmap_yz][], xz=plt[:heatmap_xz][], xy=plt[:heatmap_xy][])
+
+    cam3d!(ax.scene, projectiontype = Makie.Perspective)
+
+    cb = Colorbar(fig[1, 2], current_heatmaps[].xy, label = cb_label, width = 16)
+    colsize!(fig.layout, 2, Relative(0.04))
+
+    function fit_camera!(xv, yv, zv)
+        xmin, xmax = extrema(xv)
+        ymin, ymax = extrema(yv)
+        zmin, zmax = extrema(zv)
+        center = Vec3f((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+        spanx = Float32(xmax - xmin)
+        spany = Float32(ymax - ymin)
+        spanz = Float32(zmax - zmin)
+        horiz = max(spanx, spany)
+        zlift = max(spanz, 0.45f0 * horiz)
+        dir_norm = sqrt(default_view_direction[1]^2 + default_view_direction[2]^2 + default_view_direction[3]^2)
+        dirx = default_view_direction[1] / dir_norm
+        diry = default_view_direction[2] / dir_norm
+        dirz = default_view_direction[3] / dir_norm
+        eye = center + Vec3f(default_view_scale * dirx * horiz,
+                             default_view_scale * diry * horiz,
+                             default_view_scale * dirz * zlift)
+        update_cam!(ax.scene, eye, center, Vec3f(0, 0, 1))
+    end
+
+    fit_camera!(current_x[], current_y[], current_z[])
+
+    Label(controls[1, 1], "X:", halign = :right, fontsize = 12)
+    btn_prev_yz = Button(controls[1, 2], label = "Prev", fontsize = 10)
+    sl_yz = Slider(controls[1, 3], range = 1:length(x), startvalue = round(Int, length(x) / 2), width = 180)
+    btn_next_yz = Button(controls[1, 4], label = "Next", fontsize = 10)
+    tog_yz = Toggle(controls[1, 5], active = true)
+    lbl_yz = Label(controls[1, 6], "$(round(x[sl_yz.value[]], digits=3)) $(axis_meta.unit)", fontsize = 10, color = :gray35)
+
+    Label(controls[1, 7], "Y:", halign = :right, fontsize = 12)
+    btn_prev_xz = Button(controls[1, 8], label = "Prev", fontsize = 10)
+    sl_xz = Slider(controls[1, 9], range = 1:length(y), startvalue = round(Int, length(y) / 2), width = 180)
+    btn_next_xz = Button(controls[1, 10], label = "Next", fontsize = 10)
+    tog_xz = Toggle(controls[1, 11], active = true)
+    lbl_xz = Label(controls[1, 12], "$(round(y[sl_xz.value[]], digits=3)) $(axis_meta.unit)", fontsize = 10, color = :gray35)
+
+    Label(controls[1, 13], "Z:", halign = :right, fontsize = 12)
+    btn_prev_xy = Button(controls[1, 14], label = "Prev", fontsize = 10)
+    sl_xy = Slider(controls[1, 15], range = 1:length(z), startvalue = round(Int, length(z) / 2), width = 180)
+    btn_next_xy = Button(controls[1, 16], label = "Next", fontsize = 10)
+    tog_xy = Toggle(controls[1, 17], active = true)
+    lbl_xy = Label(controls[1, 18], "Depth: $(round(-z[sl_xy.value[]], digits=0)) m", fontsize = 10, color = :gray35)
+
+    btn_toggle = Button(controls[1, 19], label = show_full_model[] ? "Show Core" : "Show Full", fontsize = 10)
+    btn_reset = Button(controls[1, 20], label = "Reset View", fontsize = 10)
+    btn_export = Button(controls[1, 21], label = "Export", fontsize = 10)
+
+    axis_info = Observable("")
+    Label(axis_bar[1, 1], axis_info, fontsize = 11, color = :gray30, halign = :left, tellwidth = false)
+    Label(axis_bar[1, 2], "CRS: $(target_crs)", fontsize = 11, color = :gray35, halign = :right)
+
+    rowgap!(controls, 2)
     colgap!(controls, 6)
 
-    update_info! = function ()
-        x, y, z = head.x[], head.y[], head.z[]
-        info[] = @sprintf("North [%.0f, %.0f] m   East [%.0f, %.0f] m   Depth [0, %.0f] m   |   slice north %s, east %s, depth %s",
-                          minimum(x), maximum(x), minimum(y), maximum(y), maximum(-z),
-                          _format_position(x[clamp(sl_yz.value[], 1, length(x))]),
-                          _format_position(y[clamp(sl_xz.value[], 1, length(y))]),
-                          _format_position(-z[clamp(sl_xy.value[], 1, length(z))]))
+    function update_axis_info!()
+        xv = current_x[]
+        yv = current_y[]
+        zv = current_z[]
+        sx = xv[sl_yz.value[]]
+        sy = yv[sl_xz.value[]]
+        sz = -zv[sl_xy.value[]]
+        axis_info[] = "$(axis_meta.x_name): [$(round(minimum(xv), digits=3)), $(round(maximum(xv), digits=3))] $(axis_meta.unit)   $(axis_meta.y_name): [$(round(minimum(yv), digits=3)), $(round(maximum(yv), digits=3))] $(axis_meta.unit)   Depth: [0, $(round(maximum(-zv), digits=0))] m   |   Slice: $(axis_meta.x_name)=$(round(sx, digits=3)) $(axis_meta.unit), $(axis_meta.y_name)=$(round(sy, digits=3)) $(axis_meta.unit), Depth=$(round(sz, digits=0)) m"
     end
 
-    plane_visibility! = function ()
-        on_yz, on_xz, on_xy = tog_yz.active[], tog_xz.active[], tog_xy.active[]
-        if !(on_yz || on_xz || on_xy)
+    function apply_plane_visibility!()
+        yz_on = tog_yz.active[]
+        xz_on = tog_xz.active[]
+        xy_on = tog_xy.active[]
+        if !yz_on && !xz_on && !xy_on
             tog_xy.active[] = true
-            on_xy = true
+            yz_on = false
+            xz_on = false
+            xy_on = true
         end
-        for s in state
-            s.planes[].yz === nothing || (s.planes[].yz.visible[] = on_yz)
-            s.planes[].xz === nothing || (s.planes[].xz.visible[] = on_xz)
-            s.planes[].xy === nothing || (s.planes[].xy.visible[] = on_xy)
+        if current_heatmaps[].yz !== nothing
+            current_heatmaps[].yz.visible[] = yz_on
+        end
+        if current_heatmaps[].xz !== nothing
+            current_heatmaps[].xz.visible[] = xz_on
+        end
+        if current_heatmaps[].xy !== nothing
+            current_heatmaps[].xy.visible[] = xy_on
         end
     end
 
     on(sl_yz.value) do v
-        for s in state
-            s.plt[] === nothing || s.plt[][:update_yz][](v)
+        if current_plt[] !== nothing
+            current_plt[][:update_yz][](v)
         end
-        lbl_yz.text[] = _format_position(head.x[][clamp(v, 1, nx())])
-        update_info!()
+        lbl_yz.text[] = "$(round(current_x[][v], digits=0)) m"
+        update_axis_info!()
     end
     on(sl_xz.value) do v
-        for s in state
-            s.plt[] === nothing || s.plt[][:update_xz][](v)
+        if current_plt[] !== nothing
+            current_plt[][:update_xz][](v)
         end
-        lbl_xz.text[] = _format_position(head.y[][clamp(v, 1, ny())])
-        update_info!()
+        lbl_xz.text[] = "$(round(current_y[][v], digits=0)) m"
+        update_axis_info!()
     end
     on(sl_xy.value) do v
-        for s in state
-            s.plt[] === nothing || s.plt[][:update_xy][](v)
+        if current_plt[] !== nothing
+            current_plt[][:update_xy][](v)
         end
-        lbl_xy.text[] = _format_position(-head.z[][clamp(v, 1, ndep())])
-        update_info!()
+        lbl_xy.text[] = "Depth: $(round(-current_z[][v], digits=0)) m"
+        update_axis_info!()
     end
-    on(btn_prev_yz.clicks) do _; set_close_to!(sl_yz, max(1, sl_yz.value[] - 1)) end
-    on(btn_next_yz.clicks) do _; set_close_to!(sl_yz, min(nx(), sl_yz.value[] + 1)) end
-    on(btn_prev_xz.clicks) do _; set_close_to!(sl_xz, max(1, sl_xz.value[] - 1)) end
-    on(btn_next_xz.clicks) do _; set_close_to!(sl_xz, min(ny(), sl_xz.value[] + 1)) end
-    on(btn_prev_xy.clicks) do _; set_close_to!(sl_xy, max(1, sl_xy.value[] - 1)) end
-    on(btn_next_xy.clicks) do _; set_close_to!(sl_xy, min(ndep(), sl_xy.value[] + 1)) end
-    on(tog_yz.active) do _; plane_visibility!() end
-    on(tog_xz.active) do _; plane_visibility!() end
-    on(tog_xy.active) do _; plane_visibility!() end
-    on(btn_reset.clicks) do _; fit_camera!() end
+
+    on(btn_prev_yz.clicks) do _
+        set_close_to!(sl_yz, max(1, sl_yz.value[] - 1))
+    end
+    on(btn_next_yz.clicks) do _
+        set_close_to!(sl_yz, min(length(current_x[]), sl_yz.value[] + 1))
+    end
+    on(btn_prev_xz.clicks) do _
+        set_close_to!(sl_xz, max(1, sl_xz.value[] - 1))
+    end
+    on(btn_next_xz.clicks) do _
+        set_close_to!(sl_xz, min(length(current_y[]), sl_xz.value[] + 1))
+    end
+    on(btn_prev_xy.clicks) do _
+        set_close_to!(sl_xy, max(1, sl_xy.value[] - 1))
+    end
+    on(btn_next_xy.clicks) do _
+        set_close_to!(sl_xy, min(length(current_z[]), sl_xy.value[] + 1))
+    end
+
+    on(tog_yz.active) do a
+        apply_plane_visibility!()
+    end
+    on(tog_xz.active) do a
+        apply_plane_visibility!()
+    end
+    on(tog_xy.active) do a
+        apply_plane_visibility!()
+    end
+
+    function rebuild_plot!(new_x, new_y, new_z, new_R, new_cmap)
+
+        for plot in copy(ax.scene.plots)
+            delete!(ax.scene, plot)
+        end
+
+        new_plt = volumeslices!(ax, new_x, new_y, new_z, new_R; 
+                                colormap = new_cmap, 
+                                colorrange = (cmin, cmax), 
+                                bbox_visible = true)
+        draw_overlays!(ax.scene, new_x, new_y)
+
+        current_plt[] = new_plt
+        current_heatmaps[] = (yz=new_plt[:heatmap_yz][], xz=new_plt[:heatmap_xz][], xy=new_plt[:heatmap_xy][])
+
+        sl_yz.range[] = 1:length(new_x)
+        sl_xz.range[] = 1:length(new_y)
+        sl_xy.range[] = 1:length(new_z)
+
+        set_close_to!(sl_yz, round(Int, length(new_x) / 2))
+        set_close_to!(sl_xz, round(Int, length(new_y) / 2))
+        set_close_to!(sl_xy, round(Int, length(new_z) / 2))
+
+        apply_plane_visibility!()
+
+        cb.colormap[] = new_cmap
+
+        mid_x = round(Int, length(new_x) / 2)
+        mid_y = round(Int, length(new_y) / 2)
+        mid_z = round(Int, length(new_z) / 2)
+        lbl_yz.text[] = "$(round(new_x[mid_x], digits=3)) $(axis_meta.unit)"
+        lbl_xz.text[] = "$(round(new_y[mid_y], digits=3)) $(axis_meta.unit)"
+        lbl_xy.text[] = "Depth: $(round(-new_z[mid_z], digits=0)) m"
+        update_axis_info!()
+
+        return new_plt
+    end
+
     on(btn_toggle.clicks) do _
-        show_full[] = !show_full[]
-        for s in state
-            s.x[] = show_full[] ? s.a.x_full : s.a.x_core
-            s.y[] = show_full[] ? s.a.y_full : s.a.y_core
-            s.R[] = show_full[] ? s.a.R_full : s.a.R_core
+        show_full_model[] = !show_full_model[]
+        btn_toggle.label[] = show_full_model[] ? "Show Core" : "Show Full"
+
+        if show_full_model[]
+            ix_new = ix_full
+            iy_new = iy_full
+        else
+            ix_new = ix_core
+            iy_new = iy_core
         end
-        btn_toggle.label[] = show_full[] ? "Show core" : "Show full"
-        build!()
-        sl_yz.range[] = 1:nx()
-        sl_xz.range[] = 1:ny()
-        set_close_to!(sl_yz, cld(nx(), 2))
-        set_close_to!(sl_xz, cld(ny(), 2))
-        plane_visibility!()
-        fit_camera!()
-        update_info!()
-    end
-    update_info!()
 
-    # the software backend cannot render a 3D scene, so the export is the same planes drawn flat,
-    # one row per model
-    export_figure = function (output_path = nothing)
-        i, j, k = sl_yz.value[], sl_xz.value[], sl_xy.value[]
-        neg = -head.a.z_edges
-        f   = Figure(size = (1620, 520 * ncol), fontsize = 18)
-        for (r, s) in enumerate(state)
-            xe     = show_full[] ? s.a.xe_full : s.a.xe_core
-            ye     = show_full[] ? s.a.ye_full : s.a.ye_core
-            prefix = ncol > 1 ? "$(s.label): " : ""
-            ax1 = _grav_axis(f[r, 1]; xlabel = "Y East (m)", ylabel = "X North (m)", aspect = DataAspect(),
-                             title = prefix * @sprintf("Depth %.0f m", s.a.z[k]))
-            heatmap!(ax1, ye, xe, permutedims(s.R[][:, :, k]); colormap = cmap, colorrange = (cmin, cmax),
-                     nan_color = :transparent)
-            ax2 = _grav_axis(f[r, 2]; xlabel = "X North (m)", ylabel = "Depth (m)",
-                             ytickformat = _grav_depth_tickformat,
-                             title = prefix * @sprintf("East %.0f m", s.y[][j]))
-            heatmap!(ax2, xe, neg, s.R[][:, j, :]; colormap = cmap, colorrange = (cmin, cmax),
-                     nan_color = :transparent)
-            limits!(ax2, xe[1], xe[end], neg[end], neg[1])
-            ax3 = _grav_axis(f[r, 3]; xlabel = "Y East (m)", ylabel = "Depth (m)",
-                             ytickformat = _grav_depth_tickformat,
-                             title = prefix * @sprintf("North %.0f m", s.x[][i]))
-            heatmap!(ax3, ye, neg, s.R[][i, :, :]; colormap = cmap, colorrange = (cmin, cmax),
-                     nan_color = :transparent)
-            limits!(ax3, ye[1], ye[end], neg[end], neg[1])
+        new_x = x_all[ix_new]
+        new_y = y_all[iy_new]
+        new_z = -z_all[kz]
+        new_R = A_all[ix_new, iy_new, kz]
+
+        current_x[] = new_x
+        current_y[] = new_y
+        current_z[] = new_z
+        current_R[] = new_R
+
+        rebuild_plot!(new_x, new_y, new_z, new_R, current_colormap[])
+        fit_camera!(current_x[], current_y[], current_z[])
+    end
+
+    on(btn_reset.clicks) do _
+        fit_camera!(current_x[], current_y[], current_z[])
+    end
+
+    update_axis_info!()
+
+    function export_figure()
+
+        ix_pos = sl_yz.value[]
+        iy_pos = sl_xz.value[]
+        iz_pos = sl_xy.value[]
+
+        cur_x = current_x[]
+        cur_y = current_y[]
+        cur_z = current_z[]
+
+        x_val = cur_x[ix_pos]
+        y_val = cur_y[iy_pos]
+        z_val = cur_z[iz_pos]
+
+        export_fig = Figure(size = (1200, 900), fontsize = 14)
+
+        depth_str = if abs(z_val) < 1000
+            "$(round(z_val, digits=1)) m"
+        else
+            "$(round(z_val/1000, digits=2)) km"
         end
-        Colorbar(f[1:ncol, 4]; colormap = cmap, colorrange = (cmin, cmax), label = _GRAV_DENSITY_LABEL,
-                 width = 16, height = Relative(0.8))
-        _grav_labels!(f, [(r, c) for r in 1:ncol for c in 1:3])
-        path = _export_path(output_path, output_dir, model_name, "XYZ", "n$(i)_e$(j)_d$(k)", show_full[])
-        mkpath(dirname(abspath(path)))
-        save(path, f; px_per_unit = export_dpi, backend = CairoMakie)
-        println("Figure exported: $path")
-        path
+        Label(export_fig[1, 1:2], "3D View | XY at $depth_str, X=$(round(x_val, digits=0))m, Y=$(round(y_val, digits=0))m", 
+              fontsize = 18, font = :bold)
+
+        xedges_export = edges_from_centers(cur_x)
+        yedges_export = edges_from_centers(cur_y)
+        zedges_export = edges_from_centers(cur_z)
+        xlims_export = extrema(xedges_export)
+        ylims_export = extrema(yedges_export)
+        zlims_export = extrema(zedges_export)
+
+        export_ax = Axis3(export_fig[2, 1];
+            xlabel = "x",
+            ylabel = "y",
+            zlabel = "Depth (m)",
+            ztickformat = vs -> [string(round(Int, -v)) for v in vs],    # the scene is z up: show depth
+            limits = (xlims_export, ylims_export, zlims_export),
+            xautolimitmargin = (0.0f0, 0.0f0),
+            yautolimitmargin = (0.0f0, 0.0f0),
+            zautolimitmargin = (0.0f0, 0.0f0),
+            aspect = :data,
+            xgridvisible = false,
+            ygridvisible = false,
+            zgridvisible = false,
+            xticksize = 5,
+            yticksize = 5,
+            zticksize = 5,
+            xticklabelsize = 13,
+            yticklabelsize = 13,
+            zticklabelsize = 13,
+            xticklabelfont = :bold,
+            yticklabelfont = :bold,
+            zticklabelfont = :bold,
+            xlabelsize = 14,
+            ylabelsize = 14,
+            zlabelsize = 14,
+            xlabelfont = :bold,
+            ylabelfont = :bold,
+            zlabelfont = :bold,
+            xticklabelcolor = :gray70,
+            yticklabelcolor = :gray70,
+            zticklabelcolor = :gray70,
+            xtickcolor = :gray70,
+            ytickcolor = :gray70,
+            ztickcolor = :gray70,
+            xlabelcolor = :gray65,
+            ylabelcolor = :gray65,
+            zlabelcolor = :gray65
+        )
+
+        export_plt = volumeslices!(export_ax, cur_x, cur_y, cur_z, current_R[]; 
+                                   colormap = current_colormap[], 
+                                   colorrange = (cmin, cmax), 
+                       bbox_visible = false)
+
+        export_plt[:update_yz][](ix_pos)
+        export_plt[:update_xz][](iy_pos)
+        export_plt[:update_xy][](iz_pos)
+
+        export_plt[:heatmap_yz][].visible[] = tog_yz.active[]
+        export_plt[:heatmap_xz][].visible[] = tog_xz.active[]
+        export_plt[:heatmap_xy][].visible[] = tog_xy.active[]
+
+        draw_overlays!(export_ax.scene, cur_x, cur_y; annotations = false)
+
+        cb_lbl = _value_label(log10scale)
+        Colorbar(export_fig[2, 2], export_plt[:heatmap_xy][], label = cb_lbl, labelsize = 14)
+
+        colsize!(export_fig.layout, 2, Relative(0.05))
+
+        timestamp = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
+        view_type = show_full_model[] ? "full" : "core"
+        filename = "model_3d_$(view_type)_$(timestamp).png"
+        filename = joinpath(isempty(export_dir) ? pwd() : export_dir, filename)
+
+        save(filename, export_fig, px_per_unit = 3)
+
+        println("Figure exported: $filename")
+        println("  Resolution: 3600 x 2700 pixels")
+        println("  Slices: X=$(round(x_val, digits=1))m, Y=$(round(y_val, digits=1))m, Depth=$depth_str")
+
+        return filename
     end
-    on(btn_export.clicks) do _; export_figure() end
 
-    fig, (; scenes = [s.scene[] for s in state], scene = head.scene[],
-            sliders = (; yz = sl_yz, xz = sl_xz, xy = sl_xy),
-            toggles = (; yz = tog_yz, xz = tog_xz, xy = tog_xy),
-            planes = head.planes, show_full,
-            data = (; x = head.x, y = head.y, z = head.z, R = head.R),
-            colorrange = (; cmin, cmax), fit_camera!, export_figure)
-end
-
-grav_3d_viewer(M::GravModel3D; model_name::AbstractString = "model", kwargs...) =
-    grav_3d_viewer([String(model_name) => M]; model_name, kwargs...)
-
-#---------- file entries ----------
-
-# the models of a file entry, which takes one path, a model, or a list of label => model pairs
-_entry_model(m::GravModel3D) = m
-_entry_model(m::AbstractString) = (isfile(m) || error("model file not found: $m"); ReadModel3D(m))
-
-_entry_label(m::GravModel3D) = isempty(m.name) ? "model" : splitext(basename(m.name))[1]
-_entry_label(m::AbstractString) = splitext(basename(String(m)))[1]
-
-function _plot_model_files(model_file)
-    list = model_file isa AbstractString || model_file isa GravModel3D ? [model_file] : collect(model_file)
-    isempty(list) && error("model_file is required")
-    out = Pair{String, GravModel3D}[]
-    for item in list
-        label = item isa Pair ? String(first(item)) : _entry_label(item)
-        M     = _entry_model(item isa Pair ? last(item) : item)
-        @printf("Model %s: %d x %d x %d cells, %d padding cells per lateral side\n", label, size(M.A)...,
-                M.npad[1])
-        push!(out, label => M)
+    on(btn_export.clicks) do _
+        export_figure()
     end
-    out
+
+    return fig, (
+        ax = ax,
+        sliders = (yz = sl_yz, xz = sl_xz, xy = sl_xy),
+        toggles = (yz = tog_yz, xz = tog_xz, xy = tog_xy),
+        colormap = current_colormap,
+        data = (x = current_x, y = current_y, z = current_z, R = current_R),
+        colorrange = (cmin = cmin, cmax = cmax)
+    )
 end
 
-# models, optional survey and the name the exports are built from
-function _plot_model_inputs(model_file, data_file::AbstractString)
-    models = _plot_model_files(model_file)
-    d = if isempty(data_file)
-        nothing
-    else
-        isfile(data_file) || error("data file not found: $data_file")
-        ReadData3D(data_file)
+function PlotModelXY(model_file::AbstractString, data_file::AbstractString = "";
+    crs::AbstractString = "model",
+    shapefiles = [],
+    log10_scale::Bool = false,
+    colormap = COLORMAP,
+    with_padding::Bool = false,
+    max_depth::Union{Nothing, Real} = nothing,
+    value_range = nothing,
+    show_grid::Bool = true,
+    grid_color = :black,
+    grid_linewidth::Real = 0.5,
+    grid_alpha::Real = 0.1,
+    pad_tol::Real = 0.5,
+    custom_extent = nothing,
+    viewer_figsize = (1100, 950),
+    export_dpi::Int = 3,
+    export_figsize = (1100, 900),
+    gis_output_dir::AbstractString = "",
+    interactive::Bool = true)
+
+    isempty(model_file) && error("model_file is required")
+    isfile(model_file) || error("Model file not found: $model_file")
+
+    println("Loading model: $model_file")
+    M = load_model(model_file)
+
+    println("Model loaded successfully!")
+    println("  Grid size: $(M.nx) × $(M.ny) × $(M.nz)")
+    println("  X range: $(minimum(M.x)) to $(maximum(M.x)) m")
+    println("  Y range: $(minimum(M.y)) to $(maximum(M.y)) m")
+    println("  Z range: $(minimum(M.z)) to $(maximum(M.z)) m")
+    println("  Padding cells: $(M.npad)")
+
+    crs_up = uppercase(strip(crs))
+    need_data = crs_up != "MODEL"
+
+    d = nothing
+    if !isempty(data_file) && isfile(data_file)
+        println("\nLoading data: $data_file")
+        d = load_data_grav(data_file)
+    elseif need_data
+        isempty(data_file) && error("A data file is required for crs = \"$crs\"; pass data_file, or use crs = \"model\"")
+        error("Data file not found: $data_file")
     end
-    d === nothing || @printf("Survey %s: %d stations, %s\n", basename(data_file), ndata(d), d.crs)
-    models, d, length(models) > 1 ? "compare" : first(first(models))
+
+    println("\nCoordinate conversion:")
+    crs_extent = _convert_extent_to_crs(custom_extent, crs)
+    if !isnothing(custom_extent)
+        if isnothing(crs_extent)
+            println("  Custom extent: ignored (not supported for this CRS)")
+        else
+            println("  Custom extent (lat/lon → $(crs)):")
+            println("    x-axis: $(crs_extent.min_x) .. $(crs_extent.max_x)")
+            println("    y-axis: $(crs_extent.min_y) .. $(crs_extent.max_y)")
+        end
+    end
+    M_crs, xlabel, ylabel, aspect = _build_model_in_crs(M, d, crs, crs_extent;
+        pad_tol = pad_tol, with_padding = with_padding)
+
+    loaded_shapefiles = []
+    if !isempty(shapefiles)
+        println("\nShapefile overlay:")
+        loaded_shapefiles = prepare_shapefiles(shapefiles, crs)
+    end
+
+    site_x, site_y = _stations_in_crs(d, crs)
+
+    println("\nCreating interactive depth-slice viewer...")
+
+    model_name = splitext(basename(model_file))[1]
+    if crs_up != "MODEL"
+        model_name *= "_$(replace(lowercase(strip(crs)), ":" => ""))"
+    end
+
+    fig, parts = depth_slice_viewer(M_crs;
+        export_dir      = dirname(abspath(model_file)),
+        model_name      = model_name,
+        log10scale      = log10_scale,
+        cmap            = colormap,
+        figsize         = viewer_figsize,
+        withPadding     = with_padding,
+        max_depth       = max_depth,
+        pad_tol         = pad_tol,
+        value_range = value_range,
+        show_grid       = show_grid,
+        grid_color      = grid_color,
+        grid_linewidth  = grid_linewidth,
+        grid_alpha      = grid_alpha,
+        axis_xlabel     = xlabel,
+        axis_ylabel     = ylabel,
+        axis_aspect     = aspect,
+        geographic      = (crs_up == "EPSG:4326"),
+        loaded_shapefiles = loaded_shapefiles,
+        export_dpi      = export_dpi,
+        export_figsize  = export_figsize,
+        custom_extent   = crs_extent,
+        export_crs      = crs,
+        gis_output_dir  = gis_output_dir,
+        site_x          = site_x,
+        site_y          = site_y)
+
+    println("\nViewer ready!")
+    println("  - Coordinate system: $crs")
+    println("  - Use the slider to navigate through depth layers")
+    println("  - Use Previous/Next buttons for step-by-step navigation")
+    println("  - Click 'Export Figure' for high-resolution PNG export")
+    isempty(loaded_shapefiles) || println("  - $(length(loaded_shapefiles)) shapefile(s) overlaid on the depth slice")
+
+    interactive && _open_window(fig)
+
+    return fig, parts
 end
 
-# the axes of a model panel follow the survey's CRS, the same choice the data plots make
-function _model_axes(models, d, view::Symbol)
-    east, north = _model_centre(last(first(models)))
-    _slice_axes(view, d === nothing ? "local" : d.crs, east, north)
+function _plot_model_section(model_file::AbstractString, data_file::AbstractString, crs::AbstractString)
+    isempty(model_file) && error("model_file is required")
+    isfile(model_file) || error("Model file not found: $model_file")
+
+    println("Loading model: $model_file")
+    M = load_model(model_file)
+
+    println("Model loaded successfully!")
+    println("  Grid size: $(M.nx) × $(M.ny) × $(M.nz)")
+    println("  X range: $(minimum(M.x)) to $(maximum(M.x)) m")
+    println("  Y range: $(minimum(M.y)) to $(maximum(M.y)) m")
+    println("  Z range: $(minimum(M.z)) to $(maximum(M.z)) m")
+    println("  Padding cells: $(M.npad)")
+
+    crs_up = uppercase(strip(crs))
+
+    d = nothing
+    if crs_up != "MODEL"
+        isempty(data_file) && error("A data file is required for crs = \"$crs\"; pass data_file, or use crs = \"model\"")
+        isfile(data_file) || error("Data file not found: $data_file")
+        println("\nLoading data for georeferencing: $data_file")
+        d = load_data_grav(data_file)
+    end
+
+    model_name = splitext(basename(model_file))[1]
+    if crs_up != "MODEL"
+        model_name *= "_$(replace(lowercase(strip(crs)), ":" => ""))"
+    end
+
+    return M, d, model_name
 end
 
-# open the window and block until it is closed, the way the examples are run
-function _show_viewer(fig, interactive::Bool)
-    interactive || return fig
-    Makie.update_state_before_display!(fig)
-    screen = GLMakie.Screen(fig.scene)
-    println("Close the figure window to exit")
-    wait(screen)
-    fig
+function PlotModelXZ(model_file::AbstractString, data_file::AbstractString = "";
+    crs::AbstractString = "model",
+    log10_scale::Bool = false,
+    colormap = COLORMAP,
+    with_padding::Bool = false,
+    max_depth::Union{Nothing, Real} = 200000,
+    value_range = nothing,
+    show_grid::Bool = false,
+    grid_color = :black,
+    grid_linewidth::Real = 0.5,
+    grid_alpha::Real = 0.1,
+    pad_tol::Real = 0.5,
+    viewer_figsize = (1100, 950),
+    export_dpi::Int = 3,
+    export_figsize = (1100, 900),
+    interactive::Bool = true)
+
+    M, d, model_name = _plot_model_section(model_file, data_file, crs)
+
+    println("\nCoordinate conversion:")
+    M_crs, horiz_label, slider_label, slider_unit = _build_xz_model_in_crs(M, d, crs)
+
+    println("\nCreating interactive XZ cross-section viewer...")
+
+    fig, parts = xz_slice_viewer(M_crs;
+        export_dir      = dirname(abspath(model_file)),
+        model_name      = model_name,
+        log10scale      = log10_scale,
+        cmap            = colormap,
+        figsize         = viewer_figsize,
+        withPadding     = with_padding,
+        max_depth       = max_depth,
+        pad_tol         = pad_tol,
+        value_range = value_range,
+        show_grid       = show_grid,
+        grid_color      = grid_color,
+        grid_linewidth  = grid_linewidth,
+        grid_alpha      = grid_alpha,
+        horiz_label     = horiz_label,
+        slider_label    = slider_label,
+        slider_unit     = slider_unit,
+        export_dpi      = export_dpi,
+        export_figsize  = export_figsize)
+
+    println("\nViewer ready!")
+    println("  - Coordinate system: $crs")
+    println("  - Horizontal axis: $horiz_label")
+    println("  - Slider axis: $slider_label ($slider_unit)")
+    println("  - Use the slider to navigate through $(slider_label) slices (XZ cross-sections)")
+    println("  - Use Previous/Next buttons for step-by-step navigation")
+    println("  - Click 'Export Figure' for high-resolution PNG export")
+
+    interactive && _open_window(fig)
+
+    return fig, parts
 end
 
-"""
-    PlotModelXY(model_file, data_file=""; outline_file="", with_padding=false, max_depth=nothing,
-                density_range=nothing, colormap=Reverse(:Spectral), show_grid=false, pad_tol=0.2,
-                viewer_figsize=nothing, export_dpi=3, export_figsize=nothing,
-                output_dir=pwd(), interactive=true) -> (fig, parts)
+function PlotModelYZ(model_file::AbstractString, data_file::AbstractString = "";
+    crs::AbstractString = "model",
+    log10_scale::Bool = false,
+    colormap = COLORMAP,
+    with_padding::Bool = false,
+    max_depth::Union{Nothing, Real} = 50000,
+    value_range = nothing,
+    show_grid::Bool = false,
+    grid_color = :black,
+    grid_linewidth::Real = 0.5,
+    grid_alpha::Real = 0.1,
+    pad_tol::Real = 0.5,
+    viewer_figsize = (1100, 950),
+    export_dpi::Int = 3,
+    export_figsize = (1100, 900),
+    interactive::Bool = true)
 
-Depth slices of a model file, with the stations of `data_file` and the bodies of `outline_file` drawn on every layer; `model_file` may also be a list of `label => model` pairs, drawn side by side on one slider and one colour scale.
-"""
-function PlotModelXY(model_file, data_file::AbstractString = "";
-                     outline_file::AbstractString = "",
-                     with_padding::Bool = false,
-                     max_depth = nothing,
-                     density_range = nothing,
-                     colormap = _GRAV_COLORMAP,
-                     show_grid::Bool = false,
-                     pad_tol::Real = 0.2,
-                     viewer_figsize = nothing,
-                     export_dpi::Int = 3,
-                     export_figsize = nothing,
-                     output_dir::AbstractString = pwd(),
-                     interactive::Bool = true)
-    models, d, name = _plot_model_inputs(model_file, data_file)
-    outline = isempty(outline_file) ? nothing : ReadModel3D(outline_file)
-    ha, va  = _model_axes(models, d, :xy)
-    fig, parts = depth_slice_viewer(models; model_name = name, cmap = colormap, figsize = viewer_figsize,
-                                    with_padding, max_depth, pad_tol, density_range, show_grid, outline,
-                                    station_x = d === nothing ? Float64[] : d.x,
-                                    station_y = d === nothing ? Float64[] : d.y,
-                                    axis_xlabel = ha.label, axis_ylabel = va.label,
-                                    axis_xticks = ha.ticks, axis_yticks = va.ticks,
-                                    export_dpi, export_figsize, output_dir)
-    _show_viewer(fig, interactive)
-    fig, parts
+    M, d, model_name = _plot_model_section(model_file, data_file, crs)
+
+    println("\nCoordinate conversion:")
+    M_crs, horiz_label, slider_label, slider_unit = _build_yz_model_in_crs(M, d, crs)
+
+    println("\nCreating interactive YZ cross-section viewer...")
+
+    fig, parts = yz_slice_viewer(M_crs;
+        export_dir      = dirname(abspath(model_file)),
+        model_name      = model_name,
+        log10scale      = log10_scale,
+        cmap            = colormap,
+        figsize         = viewer_figsize,
+        withPadding     = with_padding,
+        max_depth       = max_depth,
+        pad_tol         = pad_tol,
+        value_range = value_range,
+        show_grid       = show_grid,
+        grid_color      = grid_color,
+        grid_linewidth  = grid_linewidth,
+        grid_alpha      = grid_alpha,
+        horiz_label     = horiz_label,
+        slider_label    = slider_label,
+        slider_unit     = slider_unit,
+        export_dpi      = export_dpi,
+        export_figsize  = export_figsize)
+
+    println("\nViewer ready!")
+    println("  - Coordinate system: $crs")
+    println("  - Horizontal axis: $horiz_label")
+    println("  - Slider axis: $slider_label ($slider_unit)")
+    println("  - Use the slider to navigate through $(slider_label) slices (YZ cross-sections)")
+    println("  - Use Previous/Next buttons for step-by-step navigation")
+    println("  - Click 'Export Figure' for high-resolution PNG export")
+
+    interactive && _open_window(fig)
+
+    return fig, parts
 end
 
-"""
-    PlotModelXZ(model_file, data_file=""; outline_file="", show_topography=true, kwargs...) -> (fig, parts)
+function PlotModelXYZ(model_file::AbstractString, data_file::AbstractString;
+    crs::AbstractString = "PROJECT",
+    shapefile_path = nothing,
+    log10_scale::Bool = false,
+    colormap = COLORMAP,
+    value_range = nothing,
+    max_depth::Union{Nothing, Real} = 5000.0,
+    show_padding::Bool = false,
+    pad_tolerance::Real = 0.2,
+    viewer_figsize = (1800, 920),
+    default_view_direction = Vec3f(-1.05f0, -0.80f0, 0.72f0),
+    default_view_scale = 1.12f0,
+    overlay_z_fixed::Union{Nothing, Real} = nothing,
+    overlay_auto_reproject_to_wgs84::Bool = true,
+    overlay_point_color = :black,
+    overlay_line_color = :black,
+    overlay_point_size = 7,
+    overlay_line_width = 1.5,
+    show_north_arrow::Bool = true,
+    show_scale_bar::Bool = true,
+    annotation_color = :black,
+    annotation_line_width::Real = 2.0,
+    interactive::Bool = true)
 
-North-south sections of a model file, the slider stepping east through the mesh.
-"""
-function PlotModelXZ(model_file, data_file::AbstractString = "";
-                     outline_file::AbstractString = "",
-                     with_padding::Bool = false,
-                     max_depth = nothing,
-                     density_range = nothing,
-                     colormap = _GRAV_COLORMAP,
-                     show_grid::Bool = false,
-                     pad_tol::Real = 0.2,
-                     show_topography::Bool = true,
-                     viewer_figsize = nothing,
-                     export_dpi::Int = 3,
-                     export_figsize = nothing,
-                     output_dir::AbstractString = pwd(),
-                     interactive::Bool = true)
-    models, d, name = _plot_model_inputs(model_file, data_file)
-    outline = isempty(outline_file) ? nothing : ReadModel3D(outline_file)
-    ha, _   = _model_axes(models, d, :xz)
-    fig, parts = _section_viewer(models, :xz; model_name = name, cmap = colormap, figsize = viewer_figsize,
-                                 with_padding, max_depth, pad_tol, density_range, show_grid, outline,
-                                 show_topography, horiz_label = ha.label, horiz_ticks = ha.ticks,
-                                 export_dpi, export_figsize, output_dir)
-    _show_viewer(fig, interactive)
-    fig, parts
-end
+    isempty(model_file) && error("model_file is required")
+    isfile(model_file) || error("Model file not found: $model_file")
+    isempty(data_file) && error("data_file is required for georeferencing")
+    isfile(data_file) || error("Data file not found: $data_file")
 
-"""
-    PlotModelYZ(model_file, data_file=""; outline_file="", show_topography=true, kwargs...) -> (fig, parts)
+    println("Loading model from: $model_file")
+    M = load_model(model_file)
+    println("Loading data for georeference from: $data_file")
+    d = load_data_grav(data_file)
 
-East-west sections of a model file, the slider stepping north through the mesh.
-"""
-function PlotModelYZ(model_file, data_file::AbstractString = "";
-                     outline_file::AbstractString = "",
-                     with_padding::Bool = false,
-                     max_depth = nothing,
-                     density_range = nothing,
-                     colormap = _GRAV_COLORMAP,
-                     show_grid::Bool = false,
-                     pad_tol::Real = 0.2,
-                     show_topography::Bool = true,
-                     viewer_figsize = nothing,
-                     export_dpi::Int = 3,
-                     export_figsize = nothing,
-                     output_dir::AbstractString = pwd(),
-                     interactive::Bool = true)
-    models, d, name = _plot_model_inputs(model_file, data_file)
-    outline = isempty(outline_file) ? nothing : ReadModel3D(outline_file)
-    ha, _   = _model_axes(models, d, :yz)
-    fig, parts = _section_viewer(models, :yz; model_name = name, cmap = colormap, figsize = viewer_figsize,
-                                 with_padding, max_depth, pad_tol, density_range, show_grid, outline,
-                                 show_topography, horiz_label = ha.label, horiz_ticks = ha.ticks,
-                                 export_dpi, export_figsize, output_dir)
-    _show_viewer(fig, interactive)
-    fig, parts
-end
+    resolved_target_crs = _normalize_target_crs(crs)
+    _warn_if_target_crs_looks_unexpected(d, resolved_target_crs)
 
-"""
-    PlotModelXYZ(model_file, data_file=""; with_padding=false, max_depth=nothing, density_range=nothing,
-                 colormap=Reverse(:Spectral), pad_tol=0.2, viewer_figsize=nothing,
-                 show_north_arrow=true, show_scale_bar=true, export_dpi=3, output_dir=pwd(),
-                 interactive=true) -> (fig, parts)
+    if _is_project_local_crs(resolved_target_crs)
+        println("Using project-local coordinates from data origin:")
+        println("  Coordinate system: local transverse Mercator / survey metres")
+    end
 
-The three orthogonal planes of a model file in one 3D scene, with the stations of `data_file` at their elevations.
-"""
-function PlotModelXYZ(model_file, data_file::AbstractString = "";
-                      with_padding::Bool = false,
-                      max_depth = nothing,
-                      density_range = nothing,
-                      colormap = _GRAV_COLORMAP,
-                      pad_tol::Real = 0.2,
-                      viewer_figsize = nothing,
-                      show_north_arrow::Bool = true,
-                      show_scale_bar::Bool = true,
-                      export_dpi::Int = 3,
-                      output_dir::AbstractString = pwd(),
-                      interactive::Bool = true)
-    models, d, name = _plot_model_inputs(model_file, data_file)
-    top = last(first(models)).top_elevation
-    fig, parts = grav_3d_viewer(models; model_name = name, cmap = colormap, figsize = viewer_figsize,
-                                with_padding, max_depth, pad_tol, density_range,
-                                station_x = d === nothing ? Float64[] : d.x,
-                                station_y = d === nothing ? Float64[] : d.y,
-                                station_z = d === nothing ? Float64[] : d.elevation .- top,
-                                show_north_arrow, show_scale_bar, export_dpi, output_dir)
-    _show_viewer(fig, interactive)
-    fig, parts
+    x_target, y_target, lat0, lon0, shiftlat, shiftlon, lat_ref, lon_ref, mismatch_dim_consistent, station_tx, station_ty =
+        model_xy_to_target_crs_centers(M, d, resolved_target_crs)
+    wgs84_to_target = _resolve_wgs84_to_target_xy_transform(resolved_target_crs, lat0, lon0)
+    overlay_transform = (lon, lat) -> begin
+        lon_aligned = Float64(lon) + Float64(shiftlon)
+        lat_aligned = Float64(lat) + Float64(shiftlat)
+        e, n = wgs84_to_target(lon_aligned, lat_aligned)
+        return e, n
+    end
+    north_axis = :y
+
+    M_target = (
+        A = permutedims(M.A, (2, 1, 3)),
+        cx = x_target,
+        cy = y_target,
+        cz = M.cz,
+        z = M.z,
+        datum = M.datum
+    )
+
+    println("Model dimensions: $(size(M.A))")
+    println("  X cells: $(length(M.cx))")
+    println("  Y cells: $(length(M.cy))")
+    println("  Z cells: $(length(M.cz))")
+    println("Target CRS plotting:")
+    println("  Target CRS: $resolved_target_crs")
+    axis_meta = _axis_metadata_for_crs(resolved_target_crs)
+    println("  Axis convention: X=$(axis_meta.x_name), Y=$(axis_meta.y_name)")
+    println("  Axis consistency mismatch: $(round(mismatch_dim_consistent, digits=4))")
+    println("  X range: [$(round(minimum(x_target), digits=3)), $(round(maximum(x_target), digits=3))]")
+    println("  Y range: [$(round(minimum(y_target), digits=3)), $(round(maximum(y_target), digits=3))]")
+    println("  Reference lat/lon: ($(round(lat_ref, digits = 6)), $(round(lon_ref, digits = 6)))")
+    println("Model georeference:")
+    println("  Origin (lat, lon): ($(round(lat0, digits = 6)), $(round(lon0, digits = 6)))")
+    println("  Data alignment shift: Δlat=$(shiftlat), Δlon=$(shiftlon)")
+
+    println("\nLaunching 3D viewer...")
+    println("  Log10 scale: $log10_scale")
+    println("  Colormap: $colormap")
+    println("  Value range: $value_range")
+    println("  Show padding: $show_padding")
+    if !isnothing(max_depth)
+        println("  Max depth: $max_depth m")
+    end
+
+    fig, parts = model_3d_viewer(M_target;
+        export_dir      = dirname(abspath(model_file)),
+        log10scale = log10_scale,
+        cmap = colormap,
+        figsize = viewer_figsize,
+        withPadding = show_padding,
+        max_depth = max_depth,
+        pad_tol = pad_tolerance,
+        value_range = value_range,
+        target_crs = resolved_target_crs,
+        overlay_transform = overlay_transform,
+        north_axis = north_axis,
+        site_e = collect(Float64.(station_tx)),
+        site_n = collect(Float64.(station_ty)),
+        site_z = collect(Float64.(-d.z)),
+        surface_elev = M.datum .- permutedims(M.Z),
+        shapefile_path = shapefile_path,
+        overlay_z_fixed = overlay_z_fixed,
+        overlay_auto_reproject_to_wgs84 = overlay_auto_reproject_to_wgs84,
+        overlay_point_color = overlay_point_color,
+        overlay_line_color = overlay_line_color,
+        overlay_point_size = overlay_point_size,
+        overlay_line_width = overlay_line_width,
+        show_north_arrow = show_north_arrow,
+        show_scale_bar = show_scale_bar,
+        annotation_color = annotation_color,
+        annotation_line_width = annotation_line_width,
+        default_view_direction = default_view_direction,
+        default_view_scale = default_view_scale)
+
+    println("\n3D Viewer Controls:")
+    println("  - Drag: Rotate view")
+    println("  - Scroll: Zoom in/out")
+    println("  - Right-drag: Pan")
+    println("  - Prev/Next + sliders: Step or move slice planes")
+    println("  - Toggles: Show/hide planes")
+    println("  - 'Show Core/Full': Toggle padding cells")
+    println("  - 'Reset View': Reset camera angle")
+    println("  - 'Export Figure': Save high-quality PNG")
+
+    interactive && _open_window(fig)
+
+    return fig, parts
 end

@@ -17,22 +17,6 @@ makedocs(;
     # nested lists become the dropdown menus of the top navigation bar
     pages = [
         "Home" => "index.md",
-        "Getting Started" => "getting_started.md",
-        "Your Data" => [
-            "Survey and model files" => "data/files.md",
-            "Building a mesh"        => "data/mesh.md",
-            "Control files"          => "data/control_files.md",
-        ],
-        "Forward Modelling" => "forward.md",
-        "Inversion" => [
-            "Running an inversion" => "inversion/running.md",
-            "Gauss-Newton"         => "inversion/gauss_newton.md",
-            "Neural (INR)"         => "inversion/inr.md",
-            "Choosing between them" => "inversion/choosing.md",
-        ],
-        "Plots" => "plots.md",
-        "Worked Examples" => "examples.md",
-        "API" => "api.md",
     ],
 )
 

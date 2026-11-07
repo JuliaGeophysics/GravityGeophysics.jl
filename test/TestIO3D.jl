@@ -1,66 +1,85 @@
-# Model and data files
-# Author: @pankajkmishra
-# Round trips of the density model (air as 1e17, the top-elevation header) and of the .xyz
-# survey, the sensitivity of readers to malformed files, and the geographic-to-UTM projection on reading
+# Model files: layout, round trip, resistivity meshes, errors.
+# data/resistivity.rho is a LOGE resistivity model, 5 × 4 × 6, one air layer plus two
+# topography air cells at [1:2, 1, 2], a 0.3 Ω·m water cell at [4, 3, 2], 10 Ω·m at [3, 2, 4],
+# and ρ = 1000 + 100i + 10j + k in layers 5 and 6.
 
-using Test
+function demo_model()
+    dx = [3000.0, 1000, 1000, 1000, 3000]; dy = [2000.0, 500, 500, 2000]; dz = [400.0, 100, 100, 200, 400, 800]
+    A = [1e-3 * i + 1e-4 * j + 1e-5 * k for i in 1:5, j in 1:4, k in 1:6]
+    A[:, :, 1] .= NaN
+    A[1:2, 1, 2] .= NaN
+    A[3, 2, 4] = -2.5e-4                 # negative contrasts are allowed
+    A[2, 3, 5] = 0.0
+    Model(dx, dy, dz, A; origin = [-4500.0, -2500.0, -400.0], rotation = 12.5)
+end
 
-@testset "model and data I/O" begin
-    mktempdir() do dir
-        m = small_mesh(n = 5, nz = 4, h = 30.0)
-        m.A[2:3, 2:4, 2] .= 275.5
-        m.A[:, :, 1] .= NaN                      # a whole air layer
-        m.top_elevation = 143.0
-        path = WriteModel3D(joinpath(dir, "model.den"), m; title = "round trip")
-        back = ReadModel3D(path)
-        @test isequal(back.A, m.A) && back.dx == m.dx && back.dy == m.dy && back.dz == m.dz
-        @test back.origin == m.origin && back.top_elevation == 143.0
-        @test same_mesh(back, m) && air_mask(back) == air_mask(m)
-        @test count(isnan, back.A) == 25
-        @test cell_volumes(back)[1, 1, 1] ≈ 30.0^3
-        @test all(surface_depth(back)[:] .≈ 30.0)      # the first earth layer starts one cell down
+@testset "x stored backwards within each y row" begin
+    path = joinpath(mktempdir(), "tiny.den")
+    write(path, "2 2 1 0 LINEAR\n10 20\n5 5\n7\n 1 2\n 3 4\n0 0 0\n0\n")
+    m = load_model(path)
+    @test m.A[:, :, 1] == [2.0 4.0; 1.0 3.0]
+    @test m.x == [0, 10, 30] && m.y == [0, 5, 10] && m.z == [0, 7]
+    @test m.cx == [5, 20]
+end
 
-        # air is written as the file sentinel, not as NaN text
-        text = read(path, String)
-        @test occursin("1e+17", lowercase(text)) || occursin("1.000000e+17", lowercase(text))
-        @test occursin("Top elevation", text)
+@testset "round trip" begin
+    m = demo_model()
+    path = write_model(joinpath(mktempdir(), "demo.den"), m)
+    header = first(l for l in eachline(path) if !startswith(l, "#"))
+    @test header == "5 4 6 1 LINEAR"
+    r = load_model(path)
+    @test same_mesh(m, r)
+    @test isequal(isnan.(r.A), isnan.(m.A))
+    act = active_cells(m)
+    @test maximum(abs, r.A[act] .- m.A[act]) <= 1e-9 * maximum(abs, m.A[act])
+    @test r.A[3, 2, 4] < 0 && r.A[2, 3, 5] == 0
+    @test r.rotation == 12.5 && r.origin == [-4500.0, -2500.0, -400.0]
+    @test count(air_cells(r)) == 5 * 4 + 2
+    # surface: z of the first earth cell under the air
+    @test r.Z[1, 1] == -400 + 400 + 100 && r.Z[3, 3] == -400 + 400
+    @test r.npad == (1, 1)
+    @test r.cz[1] == -200
+end
 
-        # a file in another block layout is refused
-        open(joinpath(dir, "other.den"), "w") do io
-            println(io, "5 5 4")
-            println(io, "0.0")
-        end
-        @test_throws Exception ReadModel3D(joinpath(dir, "other.den"))
-        @test_throws ErrorException ReadModel3D(joinpath(dir, "absent.den"))
+@testset "resistivity file supplies the mesh" begin
+    path = joinpath(DATA, "resistivity.rho")
+    r = GravityGeophysics._model_read(path)
+    @test r.scale == "LOGE"
+    @test isnan(r.A[1, 1, 2]) && isnan(r.A[2, 1, 2]) && !isnan(r.A[3, 1, 2])
+    @test all(isnan, r.A[:, :, 1])
+    @test r.A[4, 3, 2] ≈ 0.3 rtol = 1e-4
+    @test r.A[3, 2, 4] ≈ 10 rtol = 1e-4
+    @test all(isapprox(r.A[i, j, k], 1000 + 100i + 10j + k; rtol = 1e-4) for i in 1:5, j in 1:4, k in 5:6)
+    m = load_mesh(path; value = 0.01)
+    @test count(air_cells(m)) == 22 && all(m.A[active_cells(m)] .== 0.01)
+    @test m.dx == [3000.0, 1000, 1000, 1000, 3000] && m.origin == [-4500.0, -2500.0, -400.0]
+    w = load_mesh(path; water_log10 = 0.0)
+    @test count(air_cells(w)) == 23 && isnan(w.A[4, 3, 2])
+    @test_throws ArgumentError load_model(path)
+end
 
-        # data round trip, errors included
-        d = small_survey(n = 4, h = 25.0, height = 12.0)
-        d.value .= range(-1.5, 2.5; length = ndata(d))
-        d.error .= 0.05
-        dpath = WriteData3D(joinpath(dir, "data.xyz"), d; title = "survey")
-        bd = ReadData3D(dpath)
-        @test bd.x ≈ d.x && bd.y ≈ d.y && bd.elevation ≈ d.elevation
-        @test bd.value ≈ d.value rtol = 1e-5         # values are written with six significant digits
-        @test bd.error ≈ d.error && bd.title == "survey"
-        @test ndata(bd) == 16 && sensor_depth(m, bd) ≈ m.top_elevation .- d.elevation
+@testset "errors" begin
+    dir = mktempdir()
+    bad(s) = (p = joinpath(dir, "bad.den"); write(p, s); p)
+    @test_throws ArgumentError load_model(bad("2 1 1 0 LINEAR\n1 1\n1\n1\n 1\n"))           # too few values
+    @test_throws ArgumentError load_model(bad("2 1 1 0\n1 1\n1\n1\n 1 2\n"))                # no scale
+    @test_throws ArgumentError load_model(bad("2 1 1 0 LINEAR\n1 -1\n1\n1\n 1 2\n"))        # width ≤ 0
+    @test_throws ArgumentError load_model(bad("2 1 1 1 LINEAR\n1 1\n1\n1\n 1 2\n"))         # nzAir ≥ nz
+    m = demo_model(); m.A[2, 2, 3] = Inf
+    @test_throws ArgumentError write_model(joinpath(dir, "inf.den"), m)
+end
 
-        # data_like keeps the geometry and replaces the values
-        p = data_like(d, 2 .* d.value; title = "predicted")
-        @test p.x == d.x && p.value ≈ 2 .* d.value && p.title == "predicted"
-        @test chi2_rms3d(d, d).rms == 0.0
-        @test chi2_rms3d(d, data_like(d, d.value .+ d.error)).rms ≈ 1.0
-
-        # geographic coordinates are projected to UTM on reading
-        lines = ["# Title : geographic", "# CRS : EPSG:4326",
-                 "# longitude latitude elevation value error"]
-        for (lon, lat) in ((140.50, -21.75), (140.51, -21.75), (140.50, -21.74), (140.51, -21.74))
-            push!(lines, "$lon $lat 0.0 1.0 0.1")
-        end
-        gpath = joinpath(dir, "geo.xyz")
-        write(gpath, join(lines, "\n") * "\n")
-        g = ReadData3D(gpath)
-        @test ndata(g) == 4 && occursin("327", g.crs)          # UTM zone 54 south
-        @test all(>(1e5), g.y) && all(<(0), g.x) == false      # eastings in metres, northings positive
-        @test maximum(g.y) - minimum(g.y) > 500                # about 1 km across
-    end
+@testset "datum" begin
+    dir = mktempdir()
+    m = demo_model()
+    @test m.datum == 0
+    s = Model(m.dx, m.dy, m.dz, m.A; origin = m.origin, rotation = m.rotation, datum = 344.125)
+    p = write_model(joinpath(dir, "s.den"), s)
+    @test any(==("# Datum elevation (m) : 344.125"), readlines(p))
+    r = load_model(p)
+    @test r.datum == 344.125 && same_mesh(r, s) && !same_mesh(r, m)
+    # a file without the line (MT, magnetic, older) is at sea level
+    write(joinpath(dir, "old.den"), "2 2 1 0 LINEAR\n10 20\n5 5\n7\n 1 2\n 3 4\n0 0 0\n0\n")
+    @test load_model(joinpath(dir, "old.den")).datum == 0
+    @test load_mesh(p).datum == 344.125
 end

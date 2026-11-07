@@ -1,0 +1,18 @@
+Algorithm                         : LSQR
+Initial damping factor lambda     : 1
+Exit search when rms is less than : 1
+Maximum number of iterations      : 30
+Lambda cooling factor             : 2
+Lambda cooling interval           : 1
+Target rms tolerance              : 0.1
+Max density step (kg/m3)          : Inf
+Max line search steps             : 20
+Smallness weight                  : 1
+Smoothing weight x                : 1
+Smoothing weight y                : 1
+Smoothing weight z                : 1
+Model weighting                   : depth
+Depth exponent                    : 2
+Density bounds (kg/m3)            : -1000 1000
+Maximum LSQR iterations           : 200
+LSQR tolerance                    : 0.0001

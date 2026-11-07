@@ -1,15 +1,15 @@
-# Inversion run output: every six-file Invert3D writes model.den, data.pred, History.log,
-# Summary.txt and a provenance copy of the inputs/; plots/ holds figures from the demo scripts.
-# The demos ship their inputs only; the outputs are reproduced by running the demo scripts.
+# Generated case inputs, run directories and figures (helpers/benchmarks_3D.jl, examples/*.jl)
+examples/synthetic/*.dat
+examples/synthetic/model.*
+examples/*/*.pred
+examples/*/DataFit.png
+mesh_start_model.*
 run_*/
-outputs/
-plots/
-*.pred
-sensitivity.jld2
+figures/
 
-# figures the example scripts write beside the demo inputs
-examples/**/*.png
-
+# Local example, not shared
+examples/KDISynthetic/
+examples/synthetic/
 # Julia artifacts
 *.jl.cov
 *.jl.mem
